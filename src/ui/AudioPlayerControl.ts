@@ -17,7 +17,7 @@ import { SpectrogramFrames } from "../analysis/SpectrogramFrames.js";
 import { LaneLayout, type LaneRect } from "../render/LaneLayout.js";
 import { WaveformLaneRenderer } from "../render/WaveformLaneRenderer.js";
 import { SpectrogramLaneRenderer } from "../render/SpectrogramLaneRenderer.js";
-import { WebGL2SpectrogramRenderer } from "../render/WebGL2SpectrogramRenderer.js";
+import { SpectrogramBitmapCache } from "../render/SpectrogramBitmapCache.js";
 import { PlayheadOverlay } from "../render/PlayheadOverlay.js";
 import { OverviewRenderer } from "../render/OverviewRenderer.js";
 import { InteractionController } from "../interaction/InteractionController.js";
@@ -76,8 +76,12 @@ export class AudioPlayerControl {
   private fftSize: number;
   private hop: number;
 
-  private webglSpectrogram: WebGL2SpectrogramRenderer | null = null;
-  private webglTexturesBuilt = false;
+  /** 整段语谱烘焙成图片后，缩放/跟随只做 drawImage。 */
+  private spectrogramBitmaps = new SpectrogramBitmapCache();
+  private spectrogramBakePending = false;
+  /** 语谱模式下仅 viewport 变化时走快路径（跳过频率轴重绘）。 */
+  private spectrogramViewportOnly = false;
+  private axisLayoutKey = "";
 
   constructor(options: AudioPlayerControlOptions = {}) {
     this.options = { skipSeconds: options.skipSeconds ?? 5, ...options };
@@ -149,14 +153,25 @@ export class AudioPlayerControl {
       const patchKeys = Object.keys(patch);
       if (patchKeys.includes("viewMode")) {
         this.needRender = true;
+        this.spectrogramViewportOnly = false;
       } else {
-        // 仅波形播放时允许 playhead-only；语谱播放由 startLoop 强制全量 render。
         const onlyPlayhead =
           patchKeys.length === 1 &&
           patchKeys[0] === "playheadSample" &&
-          state.transport === "playing" &&
-          state.viewMode === "waveform";
-        this.needRender = !onlyPlayhead;
+          state.transport === "playing";
+        const onlyViewport =
+          patchKeys.length === 1 &&
+          patchKeys[0] === "viewport" &&
+          state.viewMode === "spectrogram";
+        if (onlyPlayhead) {
+          this.needRender = false;
+        } else if (onlyViewport) {
+          this.needRender = true;
+          this.spectrogramViewportOnly = true;
+        } else {
+          this.needRender = true;
+          this.spectrogramViewportOnly = false;
+        }
       }
       this.bus.emit("change");
       this.updateChrome();
@@ -221,6 +236,24 @@ export class AudioPlayerControl {
         transferables.push(copy.buffer);
       }
 
+      // Adaptive analysis budget: long audio uses larger hop + fewer STFT frames.
+      const durationSec = buffer.duration;
+      let analyzeHop = this.hop;
+      let maxFrames = 4096;
+      if (durationSec > 600) {
+        // >10 min
+        analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 4));
+        maxFrames = 2048;
+      } else if (durationSec > 180) {
+        // >3 min
+        analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 6));
+        maxFrames = 3072;
+      } else if (durationSec > 60) {
+        maxFrames = 4096;
+      } else {
+        maxFrames = 6144;
+      }
+
       type SpectrogramDataPayload = {
         bins: number;
         frames: number;
@@ -249,8 +282,8 @@ export class AudioPlayerControl {
             channelData,
             sampleRate: buffer.sampleRate,
             fftSize: this.fftSize,
-            hop: this.hop,
-            maxFrames: 8192,
+            hop: analyzeHop,
+            maxFrames,
           },
           transferables,
         );
@@ -266,7 +299,21 @@ export class AudioPlayerControl {
         channelCount: response.spectrogram.channelCount,
         data: response.spectrogram.data,
       });
-      this.webglTexturesBuilt = false;
+      this.spectrogramBitmaps.dispose();
+      this.axisLayoutKey = "";
+
+      const stateAfter = this.store.getSnapshot();
+      this.bus.emit("loadprogress", {
+        stage: "analyze",
+        progress: 0.95,
+        message: "Baking spectrogram…",
+      });
+      this.setStatus("Baking spectrogram…");
+      await this.spectrogramBitmaps.bake(
+        this.spectrograms,
+        stateAfter.spectrogramMinDb,
+        stateAfter.spectrogramMaxDb,
+      );
 
       this.bus.emit("loadprogress", { stage: "done", progress: 1 });
       this.bus.emit("ready");
@@ -345,8 +392,8 @@ export class AudioPlayerControl {
       this.root.classList.remove("apc-root");
     }
     this.root = null;
-    this.webglSpectrogram = null;
-    this.webglTexturesBuilt = false;
+    this.spectrogramBitmaps.dispose();
+    this.axisLayoutKey = "";
   }
 
   private buildDom(): DocumentFragment {
@@ -387,8 +434,8 @@ export class AudioPlayerControl {
       <label><input data-act="loop" type="checkbox" /> 选区循环</label>
       <label><input data-act="gainlink" type="checkbox" checked /> 联动增益</label>
       <label>增益 <input data-act="gain" type="range" min="0.2" max="4" step="0.05" value="1" /></label>
-      <label>dB 最小 <input data-act="mindb" type="number" value="-90" style="width:56px" /></label>
-      <label>dB 最大 <input data-act="maxdb" type="number" value="-10" style="width:56px" /></label>
+      <label>dB 最小 <input data-act="mindb" type="number" value="-100" style="width:56px" /></label>
+      <label>dB 最大 <input data-act="maxdb" type="number" value="-5" style="width:56px" /></label>
       <button type="button" data-act="clear-sel">清除选区</button>
       <span class="apc-clock">00:00.000</span>
     `;
@@ -401,7 +448,7 @@ export class AudioPlayerControl {
 
     const wrap = document.createElement("div");
     wrap.className = "apc-main-wrap";
-    // WebGL spectrogram layer (behind)
+    // Spectrogram bitmap layer (behind): zoom/pan = drawImage crop
     const gl = document.createElement("canvas");
     gl.className = "apc-main apc-main-gl";
     wrap.appendChild(gl);
@@ -491,10 +538,43 @@ export class AudioPlayerControl {
     const maxDb = root.querySelector('[data-act="maxdb"]') as HTMLInputElement | null;
     minDb?.addEventListener("change", () => {
       this.store.patch({ spectrogramMinDb: Number(minDb.value) });
+      void this.rebakeSpectrogramBitmaps();
     });
     maxDb?.addEventListener("change", () => {
       this.store.patch({ spectrogramMaxDb: Number(maxDb.value) });
+      void this.rebakeSpectrogramBitmaps();
     });
+  }
+
+  private async rebakeSpectrogramBitmaps(): Promise<void> {
+    if (!this.spectrograms || this.spectrogramBakePending) return;
+    const state = this.store.getSnapshot();
+    if (
+      !this.spectrogramBitmaps.needsBake(
+        state.spectrogramMinDb,
+        state.spectrogramMaxDb,
+        this.spectrograms.channelCount,
+      )
+    ) {
+      return;
+    }
+    this.spectrogramBakePending = true;
+    try {
+      this.setStatus("Baking spectrogram…");
+      await this.spectrogramBitmaps.bake(
+        this.spectrograms,
+        state.spectrogramMinDb,
+        state.spectrogramMaxDb,
+      );
+      this.needRender = true;
+      this.setStatus(
+        `${state.channelCount} ch · ${state.sampleRate} Hz · ${(
+          state.lengthSamples / state.sampleRate
+        ).toFixed(2)}s`,
+      );
+    } finally {
+      this.spectrogramBakePending = false;
+    }
   }
 
   private onKeyDown(e: KeyboardEvent): void {
@@ -643,14 +723,19 @@ export class AudioPlayerControl {
 
   private startLoop(): void {
     const loop = () => {
-      const playing = this.store.getSnapshot().transport === "playing";
-      const spectrogram = this.store.getSnapshot().viewMode === "spectrogram";
-      if (this.needRender || (playing && spectrogram)) {
-        // 语谱 + 播放：始终全量渲染，避免 overlay-only 清掉可见内容。
-        this.render();
+      if (this.needRender) {
+        if (
+          this.spectrogramViewportOnly &&
+          this.store.getSnapshot().viewMode === "spectrogram" &&
+          this.spectrogramBitmaps.ready
+        ) {
+          this.renderSpectrogramViewportFast();
+        } else {
+          this.render();
+        }
         this.needRender = false;
-      } else if (playing) {
-        // 波形播放仍可用轻量 overlay 路径。
+        this.spectrogramViewportOnly = false;
+      } else if (this.store.getSnapshot().transport === "playing") {
         this.renderOverlaysOnly();
       }
       this.raf = requestAnimationFrame(loop);
@@ -687,8 +772,10 @@ export class AudioPlayerControl {
     const dpr = window.devicePixelRatio || 1;
     const width = this.mainCanvas.clientWidth;
     const height = this.mainCanvas.clientHeight;
-    this.mainCanvas.width = Math.max(1, Math.floor(width * dpr));
-    this.mainCanvas.height = Math.max(1, Math.floor(height * dpr));
+    const mainW = Math.max(1, Math.floor(width * dpr));
+    const mainH = Math.max(1, Math.floor(height * dpr));
+    if (this.mainCanvas.width !== mainW) this.mainCanvas.width = mainW;
+    if (this.mainCanvas.height !== mainH) this.mainCanvas.height = mainH;
     const ctx = this.mainCanvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -723,130 +810,115 @@ export class AudioPlayerControl {
         channelCount: state.channelCount,
       });
     } else if (this.spectrograms) {
-      // === WebGL2 spectrogram pixels (GPU) ===
+      // === 语谱：底层 canvas 只做整图裁剪 blit；缩放不再重算颜色 ===
       if (!this.glCanvas || !this.axisCanvas) return;
       this.glCanvas.style.visibility = "visible";
       this.axisCanvas.style.visibility = "visible";
 
-      // Sync GL canvas size only when needed (resize clears the buffer).
       const glW = Math.max(1, Math.floor(width * dpr));
       const glH = Math.max(1, Math.floor(height * dpr));
       if (this.glCanvas.width !== glW) this.glCanvas.width = glW;
       if (this.glCanvas.height !== glH) this.glCanvas.height = glH;
 
-      if (!this.webglSpectrogram) {
-        try {
-          this.webglSpectrogram = new WebGL2SpectrogramRenderer(this.glCanvas, {
-            freqBinsLog: 512,
-          });
-        } catch {
-          // WebGL2 失败则回退到 CPU 渲染（画在最上层 2d canvas，保证可见）
-          this.spectrogramRenderer.render(ctx, this.spectrograms, this.mapper, this.lanes, {
-            minDb: state.spectrogramMinDb,
-            maxDb: state.spectrogramMaxDb,
-            dimChannels,
-            channelCount: state.channelCount,
-            drawFrequencyAxis: true,
-          });
-          if (state.channelCount > 1) {
-            ctx.fillStyle = "#2a303c";
-            for (const s of this.laneLayout.hitSplitters(this.lanes)) {
-              ctx.fillRect(0, s.y - 1, width, 2);
-            }
-          }
-          this.playheadOverlay.render(
-            ctx,
-            this.mapper,
-            state.playheadSample,
-            state.selection,
-            height,
+      const glCtx = this.glCanvas.getContext("2d");
+      if (!glCtx) return;
+      glCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      glCtx.fillStyle = "#0c0e12";
+      glCtx.fillRect(0, 0, width, height);
+
+      if (
+        this.spectrogramBitmaps.needsBake(
+          state.spectrogramMinDb,
+          state.spectrogramMaxDb,
+          this.spectrograms.channelCount,
+        )
+      ) {
+        void this.rebakeSpectrogramBitmaps();
+      }
+
+      if (this.spectrogramBitmaps.ready) {
+        glCtx.imageSmoothingEnabled = true;
+        glCtx.imageSmoothingQuality = "high";
+        for (const lane of this.lanes) {
+          const dim = dimChannels?.has(lane.channel) ?? false;
+          this.spectrogramBitmaps.drawLane(
+            glCtx,
+            lane.channel,
+            lane,
+            axisW,
+            Math.max(1, width - axisW),
+            state.viewport.startSample,
+            state.viewport.endSample,
+            dim,
           );
-          this.updateChrome();
-          return;
         }
-      }
-
-      if (!this.webglTexturesBuilt) {
-        this.webglSpectrogram.buildTextures(this.spectrograms);
-        this.webglTexturesBuilt = true;
-      }
-
-      this.webglSpectrogram.clear();
-      ctx.clearRect(0, 0, width, height);
-
-      // 语谱图画在频率轴右侧的 plot 区，与时间刻度/游标共用同一套坐标
-      const plotX0 = Math.floor(axisW * dpr);
-      const plotW = Math.max(1, glW - plotX0);
-      for (const lane of this.lanes) {
-        const dim = dimChannels?.has(lane.channel) ?? false;
-        const laneH = Math.max(1, Math.floor(lane.height * dpr));
-        const laneYTop = Math.floor(lane.y * dpr);
-        const laneYGl = Math.max(0, glH - laneYTop - laneH);
-        this.webglSpectrogram.renderLane({
-          channel: lane.channel,
-          viewportStartSample: state.viewport.startSample,
-          viewportEndSample: state.viewport.endSample,
-          lanePlotXDevice: plotX0,
-          lanePlotYDevice: laneYGl,
-          lanePlotWDevice: plotW,
-          lanePlotHDevice: laneH,
+      } else {
+        // 烘焙完成前回退到 CPU 视口渲染，保证可见
+        this.spectrogramRenderer.render(ctx, this.spectrograms, this.mapper, this.lanes, {
           minDb: state.spectrogramMinDb,
           maxDb: state.spectrogramMaxDb,
-          dim,
+          dimChannels,
+          channelCount: state.channelCount,
+          drawFrequencyAxis: false,
         });
       }
 
-      // 频率轴只占左侧 gutter，不覆盖语谱/时间映射区域
-      const axisCtx = this.axisCanvas.getContext("2d");
-      if (axisCtx) {
-        const aw = Math.max(1, Math.floor(width * dpr));
-        const ah = Math.max(1, Math.floor(height * dpr));
-        if (this.axisCanvas.width !== aw) this.axisCanvas.width = aw;
-        if (this.axisCanvas.height !== ah) this.axisCanvas.height = ah;
-        axisCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        axisCtx.clearRect(0, 0, width, height);
+      // 频率轴只占左侧 gutter；布局未变时跳过重绘（缩放时不重画）
+      const layoutKey = `${state.sampleRate}:${state.channelCount}:${height}:${axisW}:${
+        state.playChannelMode.kind === "solo" ? state.playChannelMode.channel : "all"
+      }:${state.laneHeights.join(",")}`;
+      if (layoutKey !== this.axisLayoutKey) {
+        this.axisLayoutKey = layoutKey;
+        const axisCtx = this.axisCanvas.getContext("2d");
+        if (axisCtx) {
+          const aw = Math.max(1, Math.floor(width * dpr));
+          const ah = Math.max(1, Math.floor(height * dpr));
+          if (this.axisCanvas.width !== aw) this.axisCanvas.width = aw;
+          if (this.axisCanvas.height !== ah) this.axisCanvas.height = ah;
+          axisCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          axisCtx.clearRect(0, 0, width, height);
 
-        const hzMin = 20;
-        const hzMax = state.sampleRate / 2;
-        const ratios = [0, 0.25, 0.5, 0.75, 1];
+          const hzMin = 20;
+          const hzMax = state.sampleRate / 2;
+          const ratios = [0, 0.25, 0.5, 0.75, 1];
 
-        for (const lane of this.lanes) {
-          const dim = dimChannels?.has(lane.channel) ?? false;
+          for (const lane of this.lanes) {
+            const dim = dimChannels?.has(lane.channel) ?? false;
 
-          axisCtx.fillStyle = "#141820";
-          axisCtx.fillRect(0, lane.y, axisW, lane.height);
+            axisCtx.fillStyle = "#141820";
+            axisCtx.fillRect(0, lane.y, axisW, lane.height);
 
-          axisCtx.fillStyle = "#8b95a8";
-          axisCtx.font = "9px ui-sans-serif, system-ui, sans-serif";
-          axisCtx.textAlign = "right";
-          axisCtx.textBaseline = "middle";
-          for (let i = 0; i < ratios.length; i++) {
-            const r = ratios[i]!;
-            const hz = hzMax * Math.pow(hzMin / hzMax, 1 - r);
-            const y = lane.y + r * lane.height;
-            const label = hz >= 1000 ? `${(hz / 1000).toFixed(1)}k` : `${Math.round(hz)}`;
-            axisCtx.fillText(label, axisW - 4, y);
-            axisCtx.strokeStyle = "#2a303c";
-            axisCtx.beginPath();
-            axisCtx.moveTo(axisW - 3, y + 0.5);
-            axisCtx.lineTo(axisW, y + 0.5);
-            axisCtx.stroke();
+            axisCtx.fillStyle = "#8b95a8";
+            axisCtx.font = "9px ui-sans-serif, system-ui, sans-serif";
+            axisCtx.textAlign = "right";
+            axisCtx.textBaseline = "middle";
+            for (let i = 0; i < ratios.length; i++) {
+              const r = ratios[i]!;
+              const hz = hzMax * Math.pow(hzMin / hzMax, 1 - r);
+              const y = lane.y + r * lane.height;
+              const label = hz >= 1000 ? `${(hz / 1000).toFixed(1)}k` : `${Math.round(hz)}`;
+              axisCtx.fillText(label, axisW - 4, y);
+              axisCtx.strokeStyle = "#2a303c";
+              axisCtx.beginPath();
+              axisCtx.moveTo(axisW - 3, y + 0.5);
+              axisCtx.lineTo(axisW, y + 0.5);
+              axisCtx.stroke();
+            }
+
+            axisCtx.textAlign = "left";
+            axisCtx.fillStyle = dim ? "#667084" : "#e8eef8";
+            axisCtx.font = "10px ui-sans-serif, system-ui, sans-serif";
+            axisCtx.textBaseline = "top";
+            axisCtx.fillText(
+              lane.channel === 0 && state.channelCount === 2
+                ? "L"
+                : lane.channel === 1 && state.channelCount === 2
+                  ? "R"
+                  : `Ch${lane.channel + 1}`,
+              4,
+              lane.y + 4,
+            );
           }
-
-          // 通道名放在 gutter 内，避免伸进时间轴
-          axisCtx.textAlign = "left";
-          axisCtx.fillStyle = dim ? "#667084" : "#e8eef8";
-          axisCtx.font = "10px ui-sans-serif, system-ui, sans-serif";
-          axisCtx.textBaseline = "top";
-          axisCtx.fillText(
-            lane.channel === 0 && state.channelCount === 2
-              ? "L"
-              : lane.channel === 1 && state.channelCount === 2
-                ? "R"
-                : `Ch${lane.channel + 1}`,
-            4,
-            lane.y + 4,
-          );
         }
       }
     }
@@ -889,9 +961,125 @@ export class AudioPlayerControl {
     this.updateChrome();
   }
 
+  /** 缩放/平移/跟随专用：只裁剪 blit 整图 + 时间尺 + 游标，不重画频率轴、不重算颜色。 */
+  private renderSpectrogramViewportFast(): void {
+    if (!this.mainCanvas || !this.glCanvas || !this.spectrogramBitmaps.ready) {
+      this.render();
+      return;
+    }
+    const state = this.store.getSnapshot();
+    const dpr = window.devicePixelRatio || 1;
+    const width = this.mainCanvas.clientWidth;
+    const height = this.mainCanvas.clientHeight;
+    const axisW = 36;
+
+    const mainW = Math.max(1, Math.floor(width * dpr));
+    const mainH = Math.max(1, Math.floor(height * dpr));
+    if (this.mainCanvas.width !== mainW) this.mainCanvas.width = mainW;
+    if (this.mainCanvas.height !== mainH) this.mainCanvas.height = mainH;
+
+    const ctx = this.mainCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    this.mapper = new ViewportMapper({
+      sampleRate: state.sampleRate,
+      startSample: state.viewport.startSample,
+      endSample: state.viewport.endSample,
+      width: Math.max(1, width - axisW),
+      offsetX: axisW,
+    });
+    if (this.lanes.length === 0) {
+      this.lanes = this.laneLayout.compute(state.laneHeights, height);
+    }
+    this.timeRuler?.render(this.mapper, dpr);
+
+    const glW = Math.max(1, Math.floor(width * dpr));
+    const glH = Math.max(1, Math.floor(height * dpr));
+    if (this.glCanvas.width !== glW) this.glCanvas.width = glW;
+    if (this.glCanvas.height !== glH) this.glCanvas.height = glH;
+
+    let dimChannels: Set<number> | null = null;
+    if (state.playChannelMode.kind === "solo") {
+      dimChannels = new Set<number>();
+      for (let i = 0; i < state.channelCount; i++) {
+        if (i !== state.playChannelMode.channel) dimChannels.add(i);
+      }
+    }
+
+    const glCtx = this.glCanvas.getContext("2d");
+    if (!glCtx) return;
+    glCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    glCtx.fillStyle = "#0c0e12";
+    glCtx.fillRect(0, 0, width, height);
+    glCtx.imageSmoothingEnabled = true;
+    glCtx.imageSmoothingQuality = "high";
+    for (const lane of this.lanes) {
+      const dim = dimChannels?.has(lane.channel) ?? false;
+      this.spectrogramBitmaps.drawLane(
+        glCtx,
+        lane.channel,
+        lane,
+        axisW,
+        Math.max(1, width - axisW),
+        state.viewport.startSample,
+        state.viewport.endSample,
+        dim,
+      );
+    }
+
+    if (state.channelCount > 1) {
+      ctx.fillStyle = "#2a303c";
+      for (const s of this.laneLayout.hitSplitters(this.lanes)) {
+        ctx.fillRect(0, s.y - 1, width, 2);
+      }
+    }
+    this.playheadOverlay.render(
+      ctx,
+      this.mapper,
+      state.playheadSample,
+      state.selection,
+      height,
+    );
+  }
+
   private renderOverlaysOnly(): void {
-    // 波形图与游标共用同一 canvas，只能全量重绘。
-    // 语谱播放路径已在 startLoop 中强制走 render()，不会进入这里。
-    this.needRender = true;
+    if (!this.mainCanvas || !this.peaks || this.store.getSnapshot().channelCount === 0) {
+      return;
+    }
+
+    const state = this.store.getSnapshot();
+    // 波形与游标共用同一 canvas，只能全量重绘。
+    if (state.viewMode !== "spectrogram" || !this.mapper || this.lanes.length === 0) {
+      this.needRender = true;
+      return;
+    }
+
+    // 语谱：bitmap/轴层保持不动，只重画透明 overlay 上的游标/选区/分割线。
+    const dpr = window.devicePixelRatio || 1;
+    const width = this.mainCanvas.clientWidth;
+    const height = this.mainCanvas.clientHeight;
+    const ctx = this.mainCanvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    if (state.channelCount > 1) {
+      ctx.fillStyle = "#2a303c";
+      for (const s of this.laneLayout.hitSplitters(this.lanes)) {
+        ctx.fillRect(0, s.y - 1, width, 2);
+      }
+    }
+
+    this.playheadOverlay.render(
+      ctx,
+      this.mapper,
+      state.playheadSample,
+      state.selection,
+      height,
+    );
+    this.updateChrome();
   }
 }

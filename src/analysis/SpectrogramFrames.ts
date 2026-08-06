@@ -153,47 +153,33 @@ export function normalizeDb(db: number, minDb: number, maxDb: number): number {
   return Math.min(1, Math.max(0, (db - minDb) / (maxDb - minDb)));
 }
 
-/** Classic Cool Edit / Audition spectral colormap (jet-like).
- *  black → blue → cyan → green → yellow → red → white
- */
+/** Audition / Cool Edit style spectral colors with darker floor and hotter peaks. */
 export function spectrogramColor(t: number): [number, number, number] {
-  // Slight gamma so mid energy isn't washed into hot colors.
-  const x = Math.pow(Math.min(1, Math.max(0, t)), 0.9);
-  let r = 0;
-  let g = 0;
-  let b = 0;
-
-  if (x < 0.125) {
-    // black -> blue
-    const u = x / 0.125;
-    r = 0;
-    g = 0;
-    b = 0.2 + 0.8 * u;
-  } else if (x < 0.375) {
-    // blue -> cyan
-    const u = (x - 0.125) / 0.25;
-    r = 0;
-    g = u;
-    b = 1;
-  } else if (x < 0.625) {
-    // cyan -> yellow
-    const u = (x - 0.375) / 0.25;
-    r = u;
-    g = 1;
-    b = 1 - u;
-  } else if (x < 0.875) {
-    // yellow -> red
-    const u = (x - 0.625) / 0.25;
-    r = 1;
-    g = 1 - u;
-    b = 0;
-  } else {
-    // red -> white
-    const u = (x - 0.875) / 0.125;
-    r = 1;
-    g = u;
-    b = u;
+  // Compress lows, stretch highs → quieter areas stay dark, peaks pop.
+  const x = Math.pow(Math.min(1, Math.max(0, t)), 1.15);
+  // Stops inspired by classic Spectral Frequency Display.
+  const stops: Array<[number, number, number, number]> = [
+    [0.0, 0, 0, 0],
+    [0.12, 12, 0, 48],
+    [0.28, 20, 40, 160],
+    [0.42, 0, 140, 180],
+    [0.55, 40, 190, 40],
+    [0.68, 220, 210, 0],
+    [0.82, 255, 110, 0],
+    [0.93, 255, 30, 20],
+    [1.0, 255, 255, 255],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i]!;
+    const b = stops[i + 1]!;
+    if (x >= a[0] && x <= b[0]) {
+      const u = (x - a[0]) / Math.max(1e-9, b[0] - a[0]);
+      return [
+        Math.round(a[1] + (b[1] - a[1]) * u),
+        Math.round(a[2] + (b[2] - a[2]) * u),
+        Math.round(a[3] + (b[3] - a[3]) * u),
+      ];
+    }
   }
-
-  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+  return [255, 255, 255];
 }

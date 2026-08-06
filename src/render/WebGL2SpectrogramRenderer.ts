@@ -1,4 +1,5 @@
 import type { SpectrogramData } from "../analysis/SpectrogramFrames.js";
+import { spectrogramColor } from "../analysis/SpectrogramFrames.js";
 
 export type WebGL2SpectrogramRendererOptions = {
   freqBinsLog?: number;
@@ -18,6 +19,7 @@ export class WebGL2SpectrogramRenderer {
   private program: WebGLProgram | null = null;
   private vao: WebGLVertexArrayObject | null = null;
   private textures = new Map<number, TexturePerChannel>();
+  private colormapTex: WebGLTexture | null = null;
   private opts: Required<WebGL2SpectrogramRendererOptions>;
 
   private u!: {
@@ -33,6 +35,9 @@ export class WebGL2SpectrogramRenderer {
     dbFixedMin: WebGLUniformLocation | null;
     dbFixedMax: WebGLUniformLocation | null;
     tex: WebGLUniformLocation | null;
+    cmap: WebGLUniformLocation | null;
+    hop: WebGLUniformLocation | null;
+    frames: WebGLUniformLocation | null;
   };
 
   constructor(private readonly canvas: HTMLCanvasElement, options: WebGL2SpectrogramRendererOptions = {}) {
@@ -46,6 +51,7 @@ export class WebGL2SpectrogramRenderer {
       antialias: false,
       premultipliedAlpha: false,
       preserveDrawingBuffer: true,
+      powerPreference: "high-performance",
     });
     if (!gl) throw new Error("WebGL2 is not available");
     this.gl = gl;
@@ -77,23 +83,29 @@ export class WebGL2SpectrogramRenderer {
     channel: number;
     viewportStartSample: number;
     viewportEndSample: number;
-    lanePlotXDevice: number; // in device pixels
-    lanePlotYDevice: number; // in device pixels
-    lanePlotWDevice: number; // in device pixels
-    lanePlotHDevice: number; // in device pixels
+    lanePlotXDevice: number;
+    lanePlotYDevice: number;
+    lanePlotWDevice: number;
+    lanePlotHDevice: number;
     minDb: number;
     maxDb: number;
     dim: boolean;
   }): void {
-    if (!this.gl || !this.program || !this.vao) return;
+    if (!this.gl || !this.program || !this.vao || !this.colormapTex) return;
     const texInfo = this.textures.get(params.channel);
     if (!texInfo) return;
     const gl = this.gl;
 
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
+
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texInfo.tex);
+    gl.uniform1i(this.u.tex, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.colormapTex);
+    gl.uniform1i(this.u.cmap, 1);
 
     gl.uniform1f(this.u.viewportStartSample, params.viewportStartSample);
     gl.uniform1f(this.u.viewportEndSample, params.viewportEndSample);
@@ -106,15 +118,22 @@ export class WebGL2SpectrogramRenderer {
     gl.uniform1f(this.u.plotY0, params.lanePlotYDevice);
     gl.uniform1f(this.u.dbFixedMin, this.opts.dbFixedMin);
     gl.uniform1f(this.u.dbFixedMax, this.opts.dbFixedMax);
-    gl.uniform1i(this.u.tex, 0);
+    gl.uniform1f(this.u.hop, texInfo.spectrogram.hop);
+    gl.uniform1f(this.u.frames, texInfo.spectrogram.frames);
 
-    // hop is the sample distance between adjacent stored frames.
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_hop"), texInfo.spectrogram.hop);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_frames"), texInfo.spectrogram.frames);
-
-    gl.viewport(params.lanePlotXDevice, params.lanePlotYDevice, params.lanePlotWDevice, params.lanePlotHDevice);
+    gl.viewport(
+      params.lanePlotXDevice,
+      params.lanePlotYDevice,
+      params.lanePlotWDevice,
+      params.lanePlotHDevice,
+    );
     gl.enable(gl.SCISSOR_TEST);
-    gl.scissor(params.lanePlotXDevice, params.lanePlotYDevice, params.lanePlotWDevice, params.lanePlotHDevice);
+    gl.scissor(
+      params.lanePlotXDevice,
+      params.lanePlotYDevice,
+      params.lanePlotWDevice,
+      params.lanePlotHDevice,
+    );
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.disable(gl.SCISSOR_TEST);
   }
@@ -126,83 +145,43 @@ export class WebGL2SpectrogramRenderer {
     const vs = `#version 300 es
       precision highp float;
       layout(location=0) in vec2 a_pos;
-      out vec2 v_uv;
       void main(){
-        v_uv = a_pos * 0.5 + 0.5;
         gl_Position = vec4(a_pos, 0.0, 1.0);
       }
     `;
 
     const fs = `#version 300 es
       precision highp float;
-      precision highp int;
-      in vec2 v_uv;
       uniform sampler2D u_tex;
+      uniform sampler2D u_cmap;
       uniform float u_viewportStartSample;
       uniform float u_viewportEndSample;
       uniform float u_minDb;
       uniform float u_maxDb;
-      uniform float u_dim; // 1 or 0
+      uniform float u_dim;
       uniform float u_plotW;
       uniform float u_plotH;
       uniform float u_plotX0;
       uniform float u_plotY0;
       uniform float u_dbFixedMin;
       uniform float u_dbFixedMax;
-      uniform float u_hop;   // samples between frames
-      uniform float u_frames; // number of frames
+      uniform float u_hop;
+      uniform float u_frames;
       out vec4 outColor;
 
-      float normalizeDb(float db){
-        float denom = max(1e-6, (u_maxDb - u_minDb));
-        return clamp((db - u_minDb) / denom, 0.0, 1.0);
-      }
-
-      vec3 spectrogramColor(float t){
-        // Classic Cool Edit jet: black -> blue -> cyan -> yellow -> red -> white
-        float x = pow(clamp(t, 0.0, 1.0), 0.9);
-        float r = 0.0;
-        float g = 0.0;
-        float b = 0.0;
-        if (x < 0.125) {
-          float u = x / 0.125;
-          r = 0.0; g = 0.0; b = 0.2 + 0.8 * u;
-        } else if (x < 0.375) {
-          float u = (x - 0.125) / 0.25;
-          r = 0.0; g = u; b = 1.0;
-        } else if (x < 0.625) {
-          float u = (x - 0.375) / 0.25;
-          r = u; g = 1.0; b = 1.0 - u;
-        } else if (x < 0.875) {
-          float u = (x - 0.625) / 0.25;
-          r = 1.0; g = 1.0 - u; b = 0.0;
-        } else {
-          float u = (x - 0.875) / 0.125;
-          r = 1.0; g = u; b = u;
-        }
-        return vec3(r, g, b);
-      }
-
       void main(){
-        // v_uv is in [0,1] across the current viewport.
         float xRatio = (gl_FragCoord.x - u_plotX0) / max(1.0, u_plotW);
-        // yFromBottom used below; keep gl_FragCoord relative to plot origin.
-
         float sample = mix(u_viewportStartSample, u_viewportEndSample, xRatio);
-        // frame index based on stored frame start samples
         float frame = clamp(sample / max(1e-6, u_hop), 0.0, u_frames - 1.0);
         float frameNorm = (u_frames <= 1.0) ? 0.0 : (frame / (u_frames - 1.0));
-
-        // gl_FragCoord.y 从 viewport 底部向上增大。
-        // texture：v=0 高频，v=1 低频 → 底部高频、顶部低频。
         float yFromBottom = (gl_FragCoord.y - u_plotY0) / max(1.0, u_plotH);
         float v = clamp(yFromBottom, 0.0, 1.0);
 
-        float enc = texture(u_tex, vec2(frameNorm, v)).r; // [0..1] from R8
+        float enc = texture(u_tex, vec2(frameNorm, v)).r;
         float db = mix(u_dbFixedMin, u_dbFixedMax, enc);
-        float t = normalizeDb(db);
-        t *= mix(1.0, 0.35, u_dim); // dim lanes
-        vec3 rgb = spectrogramColor(t);
+        float t = clamp((db - u_minDb) / max(1e-6, (u_maxDb - u_minDb)), 0.0, 1.0);
+        t *= mix(1.0, 0.35, u_dim);
+        vec3 rgb = texture(u_cmap, vec2(t, 0.5)).rgb;
         outColor = vec4(rgb, 1.0);
       }
     `;
@@ -216,14 +195,7 @@ export class WebGL2SpectrogramRenderer {
     this.vao = vao;
     gl.bindVertexArray(vao);
 
-    const quad = new Float32Array([
-      -1, -1,
-      1, -1,
-      1, 1,
-      -1, -1,
-      1, 1,
-      -1, 1,
-    ]);
+    const quad = new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]);
     const buf = gl.createBuffer();
     if (!buf) throw new Error("Failed to create buffer");
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -231,7 +203,6 @@ export class WebGL2SpectrogramRenderer {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-    // uniforms
     const getU = (name: string) => gl.getUniformLocation(prog, name);
     this.u = {
       viewportStartSample: getU("u_viewportStartSample"),
@@ -246,7 +217,35 @@ export class WebGL2SpectrogramRenderer {
       dbFixedMin: getU("u_dbFixedMin"),
       dbFixedMax: getU("u_dbFixedMax"),
       tex: getU("u_tex"),
+      cmap: getU("u_cmap"),
+      hop: getU("u_hop"),
+      frames: getU("u_frames"),
     };
+
+    this.colormapTex = this.createColormapTexture();
+  }
+
+  private createColormapTexture(): WebGLTexture {
+    if (!this.gl) throw new Error("No GL");
+    const gl = this.gl;
+    const n = 256;
+    const data = new Uint8Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const [r, g, b] = spectrogramColor(i / (n - 1));
+      data[i * 3] = r;
+      data[i * 3 + 1] = g;
+      data[i * 3 + 2] = b;
+    }
+    const tex = gl.createTexture();
+    if (!tex) throw new Error("Failed to create colormap");
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, n, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, data);
+    return tex;
   }
 
   private createProgram(gl: WebGL2RenderingContext, vsSrc: string, fsSrc: string): WebGLProgram | null {
@@ -259,7 +258,6 @@ export class WebGL2SpectrogramRenderer {
     gl.attachShader(prog, fs);
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      // eslint-disable-next-line no-console
       console.error("WebGL link error:", gl.getProgramInfoLog(prog));
       return null;
     }
@@ -272,7 +270,6 @@ export class WebGL2SpectrogramRenderer {
     gl.shaderSource(sh, src);
     gl.compileShader(sh);
     if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-      // eslint-disable-next-line no-console
       console.error("WebGL shader compile error:", gl.getShaderInfoLog(sh));
       gl.deleteShader(sh);
       return null;
@@ -287,16 +284,12 @@ export class WebGL2SpectrogramRenderer {
     const freqBinsLog = this.opts.freqBinsLog;
     const hzMin = 20;
     const hzMax = spec.sampleRate / 2;
-
-    // Texture is R8: encodes db into 0..1 using fixed db range.
     const texData = new Uint8Array(spec.frames * freqBinsLog);
 
     for (let y = 0; y < freqBinsLog; y++) {
-      // Texture row 0 is bottom. We want low freq on top -> top should map to low, bottom to high.
-      // Thus row y=0(bottom) => high freq; row y=end(top) => low freq.
       const r = freqBinsLog <= 1 ? 0 : y / (freqBinsLog - 1);
       const hz = hzMax * Math.pow(hzMin / hzMax, r);
-      const binFloat = (hz * spec.fftSize) / spec.sampleRate; // 0..bins-1
+      const binFloat = (hz * spec.fftSize) / spec.sampleRate;
       const b0 = Math.max(0, Math.min(spec.bins - 1, Math.floor(binFloat)));
       const b1 = Math.max(0, Math.min(spec.bins - 1, b0 + 1));
       const t = binFloat - b0;
@@ -317,12 +310,10 @@ export class WebGL2SpectrogramRenderer {
     if (!tex) throw new Error("Failed to create texture");
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
@@ -334,7 +325,6 @@ export class WebGL2SpectrogramRenderer {
       gl.UNSIGNED_BYTE,
       texData,
     );
-
     return tex;
   }
 
@@ -351,4 +341,3 @@ export class WebGL2SpectrogramRenderer {
     this.textures.clear();
   }
 }
-

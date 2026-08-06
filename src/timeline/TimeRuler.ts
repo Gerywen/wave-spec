@@ -74,8 +74,10 @@ export class TimeRuler {
   render(mapper: ViewportMapper, dpr: number): void {
     const width = this.canvas.clientWidth;
     const height = this.canvas.clientHeight;
-    this.canvas.width = Math.max(1, Math.floor(width * dpr));
-    this.canvas.height = Math.max(1, Math.floor(height * dpr));
+    const bw = Math.max(1, Math.floor(width * dpr));
+    const bh = Math.max(1, Math.floor(height * dpr));
+    if (this.canvas.width !== bw) this.canvas.width = bw;
+    if (this.canvas.height !== bh) this.canvas.height = bh;
     const ctx = this.canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);

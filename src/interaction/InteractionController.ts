@@ -25,6 +25,8 @@ export class InteractionController {
   private heightsAtStart: number[] = [];
   private spaceDown = false;
   private unbound: Array<() => void> = [];
+  private pendingZoom: { anchor: number; factor: number } | null = null;
+  private zoomRaf = 0;
 
   constructor(
     private readonly mainEl: HTMLElement,
@@ -38,6 +40,8 @@ export class InteractionController {
   }
 
   destroy(): void {
+    if (this.zoomRaf) cancelAnimationFrame(this.zoomRaf);
+    this.zoomRaf = 0;
     for (const u of this.unbound) u();
     this.unbound = [];
   }
@@ -62,7 +66,21 @@ export class InteractionController {
       const x = e.clientX - rect.left;
       const anchor = mapper.xToSample(x);
       const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      this.timeline.zoomAt(anchor, factor);
+      // 合并同一帧内多次滚轮，避免连续 patch 造成卡顿
+      if (this.pendingZoom) {
+        this.pendingZoom.factor *= factor;
+        this.pendingZoom.anchor = anchor;
+      } else {
+        this.pendingZoom = { anchor, factor };
+      }
+      if (!this.zoomRaf) {
+        this.zoomRaf = requestAnimationFrame(() => {
+          this.zoomRaf = 0;
+          const z = this.pendingZoom;
+          this.pendingZoom = null;
+          if (z) this.timeline.zoomAt(z.anchor, z.factor);
+        });
+      }
     };
     this.mainEl.addEventListener("wheel", onWheel, { passive: false });
     this.unbound.push(() => this.mainEl.removeEventListener("wheel", onWheel));
