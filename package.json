@@ -1,0 +1,39 @@
+{
+  "name": "audio-player-control",
+  "version": "0.1.0",
+  "description": "Multi-lane waveform/spectrogram audio player control",
+  "type": "module",
+  "main": "./dist/audio-player-control.js",
+  "module": "./dist/audio-player-control.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/audio-player-control.js"
+    },
+    "./style.css": "./dist/audio-player-control.css"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:lib": "tsc --noEmit && vite build --config vite.lib.config.ts",
+    "preview": "vite preview"
+  },
+  "keywords": [
+    "audio",
+    "waveform",
+    "spectrogram",
+    "player"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "~5.7.3",
+    "vite": "^6.2.4",
+    "vite-plugin-dts": "^4.5.3",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
+  }
+}

@@ -1,0 +1,3 @@
+# Keep wasm-pack outputs in git so the JS package builds without a Rust toolchain.
+# Ignore only local package metadata noise.
+package.json

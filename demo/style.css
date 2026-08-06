@@ -1,0 +1,88 @@
+:root {
+  color-scheme: dark;
+  font-family: "IBM Plex Sans", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #1a2a40 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #1c1830 0%, transparent 50%),
+    #0a0c10;
+  color: #e8eef8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 20px 24px 28px;
+  gap: 16px;
+}
+
+.demo-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.demo-header h1 {
+  margin: 0 0 4px;
+  font-size: 1.6rem;
+  letter-spacing: -0.02em;
+}
+
+.demo-header p {
+  margin: 0;
+  color: #9aa6bb;
+  font-size: 0.92rem;
+}
+
+.demo-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.file-btn,
+.demo-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #3a4558;
+  background: linear-gradient(180deg, #243044, #1a2230);
+  color: #e8eef8;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.file-btn:hover,
+.demo-actions button:hover {
+  border-color: #5aa0ff;
+}
+
+.demo-player {
+  flex: 1;
+  min-height: 520px;
+}
+
+.demo-footer {
+  color: #7f8aa0;
+  font-size: 12px;
+}
+
+.demo-footer p {
+  margin: 0;
+  line-height: 1.5;
+}

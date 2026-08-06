@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-demo
+.DS_Store
+*.local
+.docx-venv
+rust/target
+*.log
+.idea
+.vscode

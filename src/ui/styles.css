@@ -1,0 +1,140 @@
+.apc-root {
+  --apc-bg: #0e1116;
+  --apc-panel: #161a22;
+  --apc-border: #2a303c;
+  --apc-text: #d7deea;
+  --apc-muted: #8b95a8;
+  --apc-accent: #4aa3ff;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+  background: var(--apc-bg);
+  color: var(--apc-text);
+  font-family: "IBM Plex Sans", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  border: 1px solid var(--apc-border);
+  border-radius: 8px;
+  overflow: hidden;
+  user-select: none;
+}
+
+.apc-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--apc-panel);
+  border-bottom: 1px solid var(--apc-border);
+}
+
+.apc-toolbar button,
+.apc-toolbar select {
+  appearance: none;
+  border: 1px solid var(--apc-border);
+  background: #1c2230;
+  color: var(--apc-text);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.apc-toolbar button:hover,
+.apc-toolbar select:hover {
+  border-color: var(--apc-accent);
+}
+
+.apc-toolbar button.active {
+  background: #243147;
+  border-color: var(--apc-accent);
+  color: #fff;
+}
+
+.apc-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.apc-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--apc-muted);
+}
+
+.apc-toolbar input[type="range"] {
+  width: 80px;
+}
+
+.apc-clock {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: #e8eef8;
+  min-width: 96px;
+  text-align: right;
+}
+
+.apc-status {
+  font-size: 12px;
+  color: var(--apc-muted);
+  padding: 0 10px 6px;
+}
+
+.apc-ruler {
+  height: 28px;
+  width: 100%;
+  display: block;
+  background: #1a1d23;
+}
+
+.apc-main-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 180px;
+}
+
+.apc-main {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+}
+
+.apc-main-gl {
+  z-index: 1;
+  pointer-events: none;
+}
+
+.apc-axis-2d {
+  z-index: 2;
+  pointer-events: none;
+}
+
+.apc-main-2d {
+  z-index: 3;
+}
+
+.apc-overview {
+  height: 48px;
+  width: 100%;
+  display: block;
+  border-top: 1px solid var(--apc-border);
+  cursor: pointer;
+}
+
+.apc-split-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 6px;
+  margin-top: -3px;
+  cursor: row-resize;
+  pointer-events: none;
+}
