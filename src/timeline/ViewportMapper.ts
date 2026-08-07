@@ -38,31 +38,12 @@ export class ViewportMapper {
     return this.endSample - this.startSample;
   }
 
-  get durationSeconds(): number {
-    return this.durationSamples / this.sampleRate;
-  }
-
   get samplesPerPixel(): number {
     return this.durationSamples / this.width;
   }
 
   get plotRight(): number {
     return this.offsetX + this.width;
-  }
-
-  withRange(
-    startSample: number,
-    endSample: number,
-    width = this.width,
-    offsetX = this.offsetX,
-  ): ViewportMapper {
-    return new ViewportMapper({
-      sampleRate: this.sampleRate,
-      startSample,
-      endSample,
-      width,
-      offsetX,
-    });
   }
 
   /** Convert sample → canvas X (includes offsetX). */
@@ -78,9 +59,5 @@ export class ViewportMapper {
 
   sampleToTime(sample: number): number {
     return sample / this.sampleRate;
-  }
-
-  timeToSample(timeSeconds: number): number {
-    return timeSeconds * this.sampleRate;
   }
 }

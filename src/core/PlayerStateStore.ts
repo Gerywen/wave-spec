@@ -103,7 +103,7 @@ export class PlayerStateStore {
     return this.state;
   }
 
-  resetForBuffer(buffer: AudioBuffer, options?: { keepViewMode?: boolean }): void {
+  resetForBuffer(buffer: AudioBuffer): void {
     const channelCount = buffer.numberOfChannels;
     const lengthSamples = buffer.length;
     const equal = 1 / Math.max(1, channelCount);
@@ -118,7 +118,7 @@ export class PlayerStateStore {
       laneHeights: Array.from({ length: channelCount }, () => equal),
       waveformGain: Array.from({ length: channelCount }, () => 1),
       transport: "idle",
-      ...(options?.keepViewMode ? {} : { viewMode: "waveform" as const }),
+      viewMode: "waveform",
     });
   }
 }

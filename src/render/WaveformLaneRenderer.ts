@@ -1,7 +1,16 @@
-import type { WaveformPeaks } from "../analysis/WaveformPeaks.js";
 import type { ViewportMapper } from "../timeline/ViewportMapper.js";
 import type { LaneRect } from "./LaneLayout.js";
 import { defaultChannelLabel } from "../types.js";
+
+/** Minimal peaks API used by the waveform renderer (static or live). */
+export type PeaksQueryable = {
+  query(
+    channel: number,
+    startSample: number,
+    endSample: number,
+    columns: number,
+  ): Float32Array;
+};
 
 export type WaveformLaneRenderOptions = {
   gains: number[];
@@ -12,7 +21,7 @@ export type WaveformLaneRenderOptions = {
 export class WaveformLaneRenderer {
   render(
     ctx: CanvasRenderingContext2D,
-    peaks: WaveformPeaks,
+    peaks: PeaksQueryable,
     mapper: ViewportMapper,
     lanes: LaneRect[],
     options: WaveformLaneRenderOptions,

@@ -2,9 +2,7 @@ import init, { stretch_wsola } from "../wasm/wasm_analyzer.js";
 
 /**
  * WSOLA-like time stretching backed by Rust/WASM.
- *
- * Strategy B: compute on cache miss (i.e. first time a given rate is requested),
- * then cache the resulting AudioBuffer in `TransportController`.
+ * Transport stretches short windows (not the whole file) and caches results.
  */
 export class TimeStretchEngineWasm {
   private static wasmReady: Promise<unknown> | null = null;
@@ -48,4 +46,3 @@ function cloneBuffer(buffer: AudioBuffer, ctx: BaseAudioContext): AudioBuffer {
   }
   return out;
 }
-

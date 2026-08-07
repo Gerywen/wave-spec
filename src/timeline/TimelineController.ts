@@ -77,12 +77,6 @@ export class TimelineController {
     this.store.patch({ viewport: { startSample: start, endSample: end } });
   }
 
-  setPlayhead(sample: number): void {
-    const length = this.length();
-    const playheadSample = clamp(sample, 0, length);
-    this.store.patch({ playheadSample });
-  }
-
   /** Keep playhead visible near the right edge while following. */
   followIfNeeded(marginRatio = 0.15): void {
     const state = this.store.getSnapshot();

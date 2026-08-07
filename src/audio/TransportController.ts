@@ -10,10 +10,20 @@ export type TransportEvents = {
 
 type Listener = () => void;
 
+type StretchCacheEntry = {
+  key: string;
+  buffer: AudioBuffer;
+};
+
+/** Source-seconds stretched per chunk (pitch-preserving path). */
+const STRETCH_WINDOW_SEC = 45;
+const STRETCH_CACHE_MAX = 12;
+const PREWARM_RATES = [0.5, 0.75, 1.25, 1.5, 2];
+
 export class TransportController {
   readonly audioContext: AudioContext;
   private buffer: AudioBuffer | null = null;
-  private stretchedCache = new Map<string, AudioBuffer>();
+  private stretchCache: StretchCacheEntry[] = [];
   private source: AudioBufferSourceNode | null = null;
   private readonly router: ChannelRouter;
   private readonly masterGain: GainNode;
@@ -28,6 +38,13 @@ export class TransportController {
   private endedListeners = new Set<Listener>();
   private suppressEnded = false;
   private raf = 0;
+
+  /** Original-timeline end of the currently playing stretched chunk. */
+  private playSegEnd = 0;
+  private playRangeEnd = 0;
+
+  private bufferEpoch = 0;
+  private warmEpoch = 0;
 
   constructor(
     private readonly store: PlayerStateStore,
@@ -45,13 +62,26 @@ export class TransportController {
     return () => this.endedListeners.delete(listener);
   }
 
-  setBuffer(buffer: AudioBuffer): void {
-    this.stopInternal(false);
+  setBuffer(buffer: AudioBuffer, opts?: { syncTransport?: boolean }): void {
+    this.stopInternal(true);
     this.buffer = buffer;
-    this.stretchedCache.clear();
+    this.bufferEpoch++;
+    this.stretchCache = [];
     const state = this.store.getSnapshot();
     this.router.configure(buffer.numberOfChannels, state.playChannelMode);
     this.applyVolume();
+    // 默认把 playing 同步成 paused；编辑续播路径会传 syncTransport:false 后自行 play()。
+    if (opts?.syncTransport !== false && state.transport === "playing") {
+      this.store.patch({ transport: "paused" });
+    }
+  }
+
+  getBuffer(): AudioBuffer | null {
+    return this.buffer;
+  }
+
+  isPlaying(): boolean {
+    return this.playing;
   }
 
   setChannelMode(mode: PlayChannelMode): void {
@@ -123,12 +153,47 @@ export class TransportController {
       if (start >= end) start = sel.startSample;
     }
 
+    start = Math.max(0, Math.min(this.buffer.length, start));
+    end = Math.max(start, Math.min(this.buffer.length, end));
+    // 若游标已在结尾（或未归零的旧状态），从开头 / 选区起点重播
+    if (start >= end - 1) {
+      if (this.playSelectionOnly && this.selection) {
+        start = normalizeSelection(this.selection).startSample;
+        end = normalizeSelection(this.selection).endSample;
+      } else {
+        start = 0;
+        end = this.buffer.length;
+      }
+    }
+    if (start >= end) return;
+
     this.stopInternal(true);
-    const playBuffer = this.getPlayBuffer(this.rate);
-    // Map samples: stretched buffer timeline is compressed by rate
+    this.playRangeEnd = end;
+
     const rate = this.rate;
-    const srcStart = start / rate;
-    const srcDuration = (end - start) / rate;
+    const useSegment = Math.abs(rate - 1) >= 1e-3;
+
+    let playBuffer: AudioBuffer;
+    let offsetSeconds: number;
+    let durationSeconds: number;
+
+    if (!useSegment) {
+      playBuffer = this.buffer;
+      offsetSeconds = start / playBuffer.sampleRate;
+      durationSeconds = (end - start) / playBuffer.sampleRate;
+      this.playSegEnd = end;
+    } else {
+      const win = Math.max(1, Math.floor(STRETCH_WINDOW_SEC * this.buffer.sampleRate));
+      const segStart = Math.floor(start);
+      const segEnd = Math.min(end, segStart + win);
+      playBuffer = this.getStretchedSegment(rate, segStart, segEnd);
+      // Chunk always starts at segStart → play from 0 of stretched buffer.
+      offsetSeconds = 0;
+      durationSeconds = playBuffer.duration;
+      this.playSegEnd = segEnd;
+      // Prefetch next chunk while this one plays.
+      this.prefetchSegment(rate, segEnd, end);
+    }
 
     const source = this.audioContext.createBufferSource();
     source.buffer = playBuffer;
@@ -140,13 +205,19 @@ export class TransportController {
         void this.play(normalizeSelection(this.selection).startSample);
         return;
       }
+      // Chain next stretch window when pitch-preserving rate uses segments.
+      if (Math.abs(this.rate - 1) >= 1e-3 && this.playSegEnd < this.playRangeEnd - 1) {
+        void this.play(this.playSegEnd);
+        return;
+      }
       this.playing = false;
       this.source = null;
-      const finalSample =
+      // 播完自动归位，便于直接再点播放（停在末尾会导致 start>=end 无法开播）
+      const resetSample =
         this.playSelectionOnly && this.selection
-          ? normalizeSelection(this.selection).endSample
-          : this.buffer?.length ?? 0;
-      this.store.patch({ transport: "paused", playheadSample: finalSample });
+          ? normalizeSelection(this.selection).startSample
+          : 0;
+      this.store.patch({ transport: "paused", playheadSample: resetSample });
       for (const l of this.endedListeners) l();
     };
 
@@ -155,7 +226,7 @@ export class TransportController {
     this.anchorContextTime = this.audioContext.currentTime;
     this.playing = true;
     this.store.patch({ transport: "playing", playheadSample: start });
-    source.start(0, srcStart / playBuffer.sampleRate, Math.max(0, srcDuration / playBuffer.sampleRate));
+    source.start(0, offsetSeconds, Math.max(0, durationSeconds));
     this.startClock();
   }
 
@@ -197,20 +268,69 @@ export class TransportController {
     }
   }
 
-  private getPlayBuffer(rate: number): AudioBuffer {
-    if (!this.buffer) throw new Error("No buffer");
-    const key = rate.toFixed(4);
-    let cached = this.stretchedCache.get(key);
-    if (!cached) {
-      cached = this.stretcher.stretch(this.buffer, rate, this.audioContext);
-      this.stretchedCache.set(key, cached);
-      // Limit cache size
-      if (this.stretchedCache.size > 4) {
-        const first = this.stretchedCache.keys().next().value;
-        if (first) this.stretchedCache.delete(first);
-      }
+  /**
+   * Idle-prewarm common rates for a window starting at `fromSample`.
+   * Call after load / edit; safe to overlap — older runs are cancelled via epoch.
+   */
+  async prewarmRates(fromSample = 0, rates: number[] = PREWARM_RATES): Promise<void> {
+    const buffer = this.buffer;
+    if (!buffer) return;
+    await TimeStretchEngineWasm.ensureWasm();
+
+    const epoch = ++this.warmEpoch;
+    const bufferEpoch = this.bufferEpoch;
+    const win = Math.max(1, Math.floor(STRETCH_WINDOW_SEC * buffer.sampleRate));
+    const lo = Math.max(0, Math.min(buffer.length - 1, Math.floor(fromSample)));
+    const hi = Math.min(buffer.length, lo + win);
+    if (hi <= lo) return;
+
+    for (const rate of rates) {
+      if (epoch !== this.warmEpoch || bufferEpoch !== this.bufferEpoch) return;
+      if (Math.abs(rate - 1) < 1e-3) continue;
+      this.getStretchedSegment(rate, lo, hi);
+      await yieldToMain();
     }
-    return cached;
+  }
+
+  private getStretchedSegment(rate: number, lo: number, hi: number): AudioBuffer {
+    if (!this.buffer) throw new Error("No buffer");
+    const key = `${rate.toFixed(4)}:${lo}:${hi}`;
+    const hit = this.stretchCache.find((e) => e.key === key);
+    if (hit) {
+      // LRU bump
+      this.stretchCache = this.stretchCache.filter((e) => e.key !== key);
+      this.stretchCache.push(hit);
+      return hit.buffer;
+    }
+
+    const slice = sliceAudioBuffer(this.audioContext, this.buffer, lo, hi);
+    const stretched = this.stretcher.stretch(slice, rate, this.audioContext);
+    this.stretchCache.push({ key, buffer: stretched });
+    while (this.stretchCache.length > STRETCH_CACHE_MAX) {
+      this.stretchCache.shift();
+    }
+    return stretched;
+  }
+
+  private prefetchSegment(rate: number, nextStart: number, rangeEnd: number): void {
+    if (!this.buffer || nextStart >= rangeEnd - 1) return;
+    const bufferEpoch = this.bufferEpoch;
+    const win = Math.max(1, Math.floor(STRETCH_WINDOW_SEC * this.buffer.sampleRate));
+    const lo = nextStart;
+    const hi = Math.min(rangeEnd, lo + win);
+    const key = `${rate.toFixed(4)}:${lo}:${hi}`;
+    if (this.stretchCache.some((e) => e.key === key)) return;
+
+    void (async () => {
+      await yieldToMain();
+      if (!this.buffer || bufferEpoch !== this.bufferEpoch) return;
+      if (Math.abs(this.rate - rate) > 1e-9) return;
+      try {
+        this.getStretchedSegment(rate, lo, hi);
+      } catch {
+        /* ignore prefetch errors */
+      }
+    })();
   }
 
   private stopInternal(suppressEnded: boolean): void {
@@ -248,6 +368,7 @@ export class TransportController {
   }
 
   dispose(): void {
+    this.warmEpoch++;
     this.stopInternal(true);
     this.router.dispose();
     try {
@@ -261,4 +382,30 @@ export class TransportController {
 function normalizeSelection(sel: SelectionRange): SelectionRange {
   if (sel.startSample <= sel.endSample) return sel;
   return { startSample: sel.endSample, endSample: sel.startSample };
+}
+
+function sliceAudioBuffer(
+  ctx: BaseAudioContext,
+  buffer: AudioBuffer,
+  lo: number,
+  hi: number,
+): AudioBuffer {
+  const start = Math.max(0, Math.min(buffer.length, Math.floor(lo)));
+  const end = Math.max(start + 1, Math.min(buffer.length, Math.ceil(hi)));
+  const n = end - start;
+  const out = ctx.createBuffer(buffer.numberOfChannels, n, buffer.sampleRate);
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    out.getChannelData(ch).set(buffer.getChannelData(ch).subarray(start, end));
+  }
+  return out;
+}
+
+function yieldToMain(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(() => resolve(), { timeout: 32 });
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
 }

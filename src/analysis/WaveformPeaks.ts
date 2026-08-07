@@ -1,8 +1,3 @@
-export type PeakColumn = {
-  min: number;
-  max: number;
-};
-
 export type WaveformPeaksPrecomputed = {
   /** levels[channel][levelIndex] = interleaved min/max per column */
   levels: Float32Array[][];

@@ -12,17 +12,30 @@ export type {
 } from "./types.js";
 export { defaultChannelLabel, createInitialState } from "./types.js";
 
+export { AudioLoader } from "./audio/AudioLoader.js";
+export { ChannelRouter } from "./audio/ChannelRouter.js";
+export { TransportController } from "./audio/TransportController.js";
+export { TimeStretchEngineWasm } from "./audio/TimeStretchEngineWasm.js";
+export {
+  normalizeEditRange,
+  copyRange,
+  deleteRange,
+  insertAt,
+  replaceRange,
+  cloneAudioBuffer,
+} from "./audio/BufferEdit.js";
+export type { EditRange, AudioClipboard } from "./audio/BufferEdit.js";
+export { encodeWavPcm16, downloadBlob } from "./audio/WavExport.js";
+export { LiveRecorder } from "./audio/LiveRecorder.js";
+export { StreamingWaveformPeaks } from "./analysis/StreamingWaveformPeaks.js";
+
+export { EditHistory } from "./core/EditHistory.js";
 export { EventBus } from "./core/EventBus.js";
 export { PlayerStateStore } from "./core/PlayerStateStore.js";
 
 export { ViewportMapper } from "./timeline/ViewportMapper.js";
 export { TimelineController } from "./timeline/TimelineController.js";
 export { TimeRuler, formatClock, computeTicks } from "./timeline/TimeRuler.js";
-
-export { AudioLoader } from "./audio/AudioLoader.js";
-export { ChannelRouter } from "./audio/ChannelRouter.js";
-export { TransportController } from "./audio/TransportController.js";
-export { TimeStretchEngineWasm } from "./audio/TimeStretchEngineWasm.js";
 
 export { WaveformPeaks } from "./analysis/WaveformPeaks.js";
 export {
@@ -38,7 +51,6 @@ export { SpectrogramLaneRenderer } from "./render/SpectrogramLaneRenderer.js";
 export { SpectrogramBitmapCache } from "./render/SpectrogramBitmapCache.js";
 export { PlayheadOverlay } from "./render/PlayheadOverlay.js";
 export { OverviewRenderer } from "./render/OverviewRenderer.js";
-export { WebGL2SpectrogramRenderer } from "./render/WebGL2SpectrogramRenderer.js";
 
 export { InteractionController } from "./interaction/InteractionController.js";
 export { findZeroCrossing } from "./interaction/ZeroCrossingSnap.js";

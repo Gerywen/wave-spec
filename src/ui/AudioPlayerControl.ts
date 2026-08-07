@@ -22,6 +22,18 @@ import { PlayheadOverlay } from "../render/PlayheadOverlay.js";
 import { OverviewRenderer } from "../render/OverviewRenderer.js";
 import { InteractionController } from "../interaction/InteractionController.js";
 import { EventBus } from "../core/EventBus.js";
+import { EditHistory } from "../core/EditHistory.js";
+import {
+  type AudioClipboard,
+  copyRange,
+  deleteRange,
+  insertAt,
+  normalizeEditRange,
+  replaceRange,
+} from "../audio/BufferEdit.js";
+import { downloadBlob, encodeWavPcm16 } from "../audio/WavExport.js";
+import { LiveRecorder } from "../audio/LiveRecorder.js";
+import type { PeaksQueryable } from "../render/WaveformLaneRenderer.js";
 
 export type ControlEvents = {
   loadprogress: [LoadProgress];
@@ -41,7 +53,7 @@ export class AudioPlayerControl {
   private root: HTMLElement | null = null;
   private rulerCanvas: HTMLCanvasElement | null = null;
   private mainCanvas: HTMLCanvasElement | null = null;
-  private glCanvas: HTMLCanvasElement | null = null;
+  private spectrogramCanvas: HTMLCanvasElement | null = null;
   private axisCanvas: HTMLCanvasElement | null = null;
   private overviewCanvas: HTMLCanvasElement | null = null;
   private clockEl: HTMLElement | null = null;
@@ -83,6 +95,15 @@ export class AudioPlayerControl {
   private spectrogramViewportOnly = false;
   private axisLayoutKey = "";
 
+  private editHistory: EditHistory;
+  private clipboard: AudioClipboard | null = null;
+  private editBusy = false;
+
+  private recorder: LiveRecorder;
+  private recording = false;
+  /** Planned mic session length in seconds (full timeline on one screen). */
+  private recordDurationSec = 300;
+
   constructor(options: AudioPlayerControlOptions = {}) {
     this.options = { skipSeconds: options.skipSeconds ?? 5, ...options };
     // Higher FFT + reasonable hop gives noticeably better CoolEdit-like spectrogram.
@@ -93,6 +114,8 @@ export class AudioPlayerControl {
     this.loader = new AudioLoader(this.audioContext);
     this.transport = new TransportController(this.store, this.audioContext);
     this.timeline = new TimelineController(this.store);
+    this.editHistory = new EditHistory(this.audioContext, 20);
+    this.recorder = new LiveRecorder(this.audioContext);
   }
 
   mount(el: HTMLElement): void {
@@ -104,7 +127,7 @@ export class AudioPlayerControl {
 
     this.rulerCanvas = el.querySelector(".apc-ruler");
     this.mainCanvas = el.querySelector(".apc-main-2d");
-    this.glCanvas = el.querySelector(".apc-main-gl");
+    this.spectrogramCanvas = el.querySelector(".apc-main-spec");
     this.axisCanvas = el.querySelector(".apc-axis-2d");
     this.overviewCanvas = el.querySelector(".apc-overview");
     this.clockEl = el.querySelector(".apc-clock");
@@ -164,7 +187,9 @@ export class AudioPlayerControl {
           patchKeys[0] === "viewport" &&
           state.viewMode === "spectrogram";
         if (onlyPlayhead) {
-          this.needRender = false;
+          // 语谱：游标在独立 overlay，可只重画上层。
+          // 波形：游标与波形同 canvas，必须全量重绘；若置 false 会被 transport 时钟反复冲掉。
+          this.needRender = state.viewMode !== "spectrogram";
         } else if (onlyViewport) {
           this.needRender = true;
           this.spectrogramViewportOnly = true;
@@ -200,6 +225,10 @@ export class AudioPlayerControl {
   }
 
   async load(source: File | Blob | string | ArrayBuffer | AudioBuffer): Promise<void> {
+    if (this.recording) {
+      await this.recorder.stop({ finalize: false });
+      this.recording = false;
+    }
     try {
       this.isLoading = true;
       this.loadingStage = null;
@@ -213,122 +242,30 @@ export class AudioPlayerControl {
         },
       });
 
-      this.bus.emit("loadprogress", {
-        stage: "analyze",
-        progress: 0.85,
-        message: "Analyzing…",
-      });
-      this.setStatus("Analyzing (worker)…");
-
       // 预热 WSOLA/WASM 初始化：避免首次切倍速时再触发额外加载延迟。
       const wasmWarmPromise = TimeStretchEngineWasm.ensureWasm();
 
-      // Keep buffer for playback on main thread; worker will compute heavy peaks/spectrogram.
+      this.editHistory.clear();
+      this.clipboard = null;
       this.store.resetForBuffer(buffer);
       this.transport.setBuffer(buffer);
 
-      const channelCount = buffer.numberOfChannels;
-      const channelData: Float32Array[] = [];
-      const transferables: Transferable[] = [];
-      for (let ch = 0; ch < channelCount; ch++) {
-        const copy = new Float32Array(buffer.getChannelData(ch)); // safe copy (does not detach AudioBuffer)
-        channelData.push(copy);
-        transferables.push(copy.buffer);
-      }
-
-      // Adaptive analysis budget: long audio uses larger hop + fewer STFT frames.
-      const durationSec = buffer.duration;
-      let analyzeHop = this.hop;
-      let maxFrames = 4096;
-      if (durationSec > 600) {
-        // >10 min
-        analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 4));
-        maxFrames = 2048;
-      } else if (durationSec > 180) {
-        // >3 min
-        analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 6));
-        maxFrames = 3072;
-      } else if (durationSec > 60) {
-        maxFrames = 4096;
-      } else {
-        maxFrames = 6144;
-      }
-
-      type SpectrogramDataPayload = {
-        bins: number;
-        frames: number;
-        magnitudes: Float32Array;
-        fftSize: number;
-        hop: number;
-        sampleRate: number;
-      };
-
-      type WorkerResponse = {
-        peaks: { peaksLevels: Float32Array[][] };
-        spectrogram: { channelCount: number; data: SpectrogramDataPayload[] };
-      };
-
-      const worker = new Worker(
-        new URL("../workers/analysis.worker.ts", import.meta.url),
-        { type: "module" },
-      );
-
-      const response = (await new Promise<WorkerResponse>((resolve, reject) => {
-        worker.onmessage = (ev: MessageEvent<WorkerResponse>) => resolve(ev.data);
-        worker.onerror = (err) => reject(err);
-        worker.postMessage(
-          {
-            kind: "analyze",
-            channelData,
-            sampleRate: buffer.sampleRate,
-            fftSize: this.fftSize,
-            hop: analyzeHop,
-            maxFrames,
-          },
-          transferables,
-        );
-      })) as WorkerResponse;
-
-      worker.terminate();
-
-      // 确保 WSOLA/WASM 已就绪（不在首次倍速时才初始化）。
       await wasmWarmPromise;
-
-      this.peaks = new WaveformPeaks(buffer, { levels: response.peaks.peaksLevels });
-      this.spectrograms = new SpectrogramFrames({
-        channelCount: response.spectrogram.channelCount,
-        data: response.spectrogram.data,
-      });
-      this.spectrogramBitmaps.dispose();
-      this.axisLayoutKey = "";
-
-      const stateAfter = this.store.getSnapshot();
-      this.bus.emit("loadprogress", {
-        stage: "analyze",
-        progress: 0.95,
-        message: "Baking spectrogram…",
-      });
-      this.setStatus("Baking spectrogram…");
-      await this.spectrogramBitmaps.bake(
-        this.spectrograms,
-        stateAfter.spectrogramMinDb,
-        stateAfter.spectrogramMaxDb,
-      );
+      await this.reanalyzeAndBake(buffer);
 
       this.bus.emit("loadprogress", { stage: "done", progress: 1 });
       this.bus.emit("ready");
-      this.setStatus(
-        `${buffer.numberOfChannels} ch · ${buffer.sampleRate} Hz · ${buffer.duration.toFixed(2)}s`,
-      );
+      this.setStatus(this.formatBufferStatus(buffer));
       this.needRender = true;
       this.updateChrome();
+      // 空闲预热常用倍率（仅首段窗口），切速时尽量命中缓存
+      void this.transport.prewarmRates(0);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       this.bus.emit("error", error);
       this.setStatus(error.message);
       throw error;
     } finally {
-      // 无论成功/失败，都关闭 overlay，避免卡住在“Loading…”。
       this.isLoading = false;
     }
   }
@@ -373,6 +310,446 @@ export class AudioPlayerControl {
     this.timeline.fitAll();
   }
 
+  isRecording(): boolean {
+    return this.recording;
+  }
+
+  setRecordDurationSec(sec: number): void {
+    if (!(sec > 0)) return;
+    this.recordDurationSec = sec;
+    const sel = this.root?.querySelector('[data-act="rec-dur"]') as HTMLSelectElement | null;
+    if (sel && ![...sel.options].some((o) => Number(o.value) === sec)) {
+      // keep custom via number input if present
+    }
+    this.updateChrome();
+  }
+
+  async startRecording(durationSec?: number): Promise<void> {
+    if (this.recording || this.editBusy) return;
+    const dur = Math.max(1, durationSec ?? this.recordDurationSec);
+    this.recordDurationSec = dur;
+
+    this.transport.stop();
+    this.editHistory.clear();
+    this.clipboard = null;
+    this.peaks = null;
+    this.spectrograms = null;
+    this.spectrogramBitmaps.dispose();
+    this.axisLayoutKey = "";
+
+    try {
+      await this.recorder.start({
+        durationSec: dur,
+        channelCount: 1,
+        onProgress: (written, total) => {
+          this.store.patch({ playheadSample: written });
+          this.needRender = true;
+          const sec = written / (this.audioContext.sampleRate || 1);
+          const totalSec = total / (this.audioContext.sampleRate || 1);
+          this.setStatus(
+            `录音中… ${sec.toFixed(1)}s / ${totalSec.toFixed(0)}s（一屏显示全时长）`,
+          );
+        },
+        onComplete: (buffer) => {
+          void this.finalizeRecording(buffer);
+        },
+        onError: (err) => {
+          this.recording = false;
+          this.setStatus(err.message);
+          this.bus.emit("error", err);
+          this.updateChrome();
+        },
+      });
+    } catch (err) {
+      this.recording = false;
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.setStatus(error.message);
+      throw error;
+    }
+
+    const buf = this.recorder.getBuffer();
+    if (!buf) return;
+
+    this.recording = true;
+    const ch = buf.numberOfChannels;
+    const equal = 1 / Math.max(1, ch);
+    this.store.patch({
+      sampleRate: buf.sampleRate,
+      lengthSamples: buf.length,
+      channelCount: ch,
+      viewMode: "waveform",
+      viewport: { startSample: 0, endSample: buf.length },
+      playheadSample: 0,
+      selection: null,
+      playChannelMode: { kind: "original" },
+      laneHeights: Array.from({ length: ch }, () => equal),
+      waveformGain: Array.from({ length: ch }, () => 1),
+      transport: "idle",
+      followPlayhead: false,
+    });
+    this.setStatus(`录音中… 0s / ${dur}s（一屏显示全时长）`);
+    this.needRender = true;
+    this.updateChrome();
+  }
+
+  async stopRecording(): Promise<void> {
+    if (!this.recording) return;
+    await this.recorder.stop({ finalize: true });
+    // onComplete → finalizeRecording
+  }
+
+  private async finalizeRecording(buffer: AudioBuffer): Promise<void> {
+    this.recording = false;
+    this.isLoading = true;
+    try {
+      this.editHistory.clear();
+      this.store.resetForBuffer(buffer);
+      this.transport.setBuffer(buffer);
+      await this.reanalyzeAndBake(buffer);
+      this.bus.emit("ready");
+      this.setStatus(this.formatBufferStatus(buffer));
+      this.needRender = true;
+      void this.transport.prewarmRates(0);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.bus.emit("error", error);
+      this.setStatus(error.message);
+    } finally {
+      this.isLoading = false;
+      this.updateChrome();
+    }
+  }
+
+  // —— Public edit API ——
+  copySelection(): boolean {
+    if (this.recording) return false;
+    const buffer = this.transport.getBuffer();
+    if (!buffer) {
+      this.setStatus("没有可编辑的音频");
+      return false;
+    }
+    const range = normalizeEditRange(this.store.getSnapshot().selection, buffer.length);
+    if (!range) {
+      this.setStatus("请先选择一段区域");
+      return false;
+    }
+    this.clipboard = {
+      sampleRate: buffer.sampleRate,
+      channels: copyRange(buffer, range.lo, range.hi),
+    };
+    this.setStatus(`已复制 ${((range.hi - range.lo) / buffer.sampleRate).toFixed(3)}s`);
+    this.updateChrome();
+    return true;
+  }
+
+  async cutSelection(): Promise<boolean> {
+    if (this.recording) return false;
+    if (!this.copySelection()) return false;
+    return this.deleteSelection();
+  }
+
+  async deleteSelection(): Promise<boolean> {
+    if (this.recording) return false;
+    const buffer = this.transport.getBuffer();
+    if (!buffer || this.editBusy) return false;
+    const range = normalizeEditRange(this.store.getSnapshot().selection, buffer.length);
+    if (!range) {
+      this.setStatus("请先选择一段区域");
+      return false;
+    }
+    const next = deleteRange(this.audioContext, buffer, range.lo, range.hi);
+    await this.applyEditedBuffer(next, {
+      recordHistory: true,
+      playheadSample: range.lo,
+      selection: null,
+    });
+    this.setStatus("已删除选区");
+    return true;
+  }
+
+  async pasteClipboard(): Promise<boolean> {
+    if (this.recording) return false;
+    const buffer = this.transport.getBuffer();
+    if (!buffer || this.editBusy) return false;
+    if (!this.clipboard || this.clipboard.channels.length === 0) {
+      this.setStatus("剪贴板为空");
+      return false;
+    }
+    if (this.clipboard.sampleRate !== buffer.sampleRate) {
+      this.setStatus(
+        `采样率不匹配（剪贴板 ${this.clipboard.sampleRate} Hz / 当前 ${buffer.sampleRate} Hz）`,
+      );
+      return false;
+    }
+
+    const state = this.store.getSnapshot();
+    const sel = normalizeEditRange(state.selection, buffer.length);
+    const insertLen = this.clipboard.channels[0]?.length ?? 0;
+    let next: AudioBuffer;
+    let pasteLo: number;
+
+    if (sel) {
+      pasteLo = sel.lo;
+      next = replaceRange(
+        this.audioContext,
+        buffer,
+        sel.lo,
+        sel.hi,
+        this.clipboard.channels,
+      );
+    } else {
+      pasteLo = Math.max(0, Math.min(buffer.length, Math.floor(state.playheadSample)));
+      next = insertAt(this.audioContext, buffer, pasteLo, this.clipboard.channels);
+    }
+
+    const pasteHi = pasteLo + insertLen;
+    await this.applyEditedBuffer(next, {
+      recordHistory: true,
+      playheadSample: pasteHi,
+      selection:
+        insertLen > 0
+          ? { startSample: pasteLo, endSample: pasteHi }
+          : null,
+    });
+    this.setStatus("已粘贴");
+    return true;
+  }
+
+  async undo(): Promise<boolean> {
+    if (this.recording) return false;
+    const buffer = this.transport.getBuffer();
+    if (!buffer || this.editBusy || !this.editHistory.canUndo) {
+      if (!this.editHistory.canUndo) this.setStatus("没有可撤销的操作");
+      return false;
+    }
+    const prev = this.editHistory.undo(buffer);
+    if (!prev) return false;
+    await this.applyEditedBuffer(prev, {
+      recordHistory: false,
+      playheadSample: Math.min(this.store.getSnapshot().playheadSample, prev.length),
+      selection: null,
+    });
+    this.setStatus("已撤销");
+    return true;
+  }
+
+  async redo(): Promise<boolean> {
+    if (this.recording) return false;
+    const buffer = this.transport.getBuffer();
+    if (!buffer || this.editBusy || !this.editHistory.canRedo) {
+      if (!this.editHistory.canRedo) this.setStatus("没有可重做的操作");
+      return false;
+    }
+    const next = this.editHistory.redo(buffer);
+    if (!next) return false;
+    await this.applyEditedBuffer(next, {
+      recordHistory: false,
+      playheadSample: Math.min(this.store.getSnapshot().playheadSample, next.length),
+      selection: null,
+    });
+    this.setStatus("已重做");
+    return true;
+  }
+
+  exportSelection(): boolean {
+    const buffer = this.transport.getBuffer();
+    if (!buffer) {
+      this.setStatus("没有可导出的音频");
+      return false;
+    }
+    const range = normalizeEditRange(this.store.getSnapshot().selection, buffer.length);
+    if (!range) {
+      this.setStatus("请先选择一段区域");
+      return false;
+    }
+    const blob = encodeWavPcm16(buffer, range.lo, range.hi);
+    downloadBlob(blob, "selection.wav");
+    this.setStatus("已导出选区 WAV");
+    return true;
+  }
+
+  exportAll(): boolean {
+    const buffer = this.transport.getBuffer();
+    if (!buffer) {
+      this.setStatus("没有可导出的音频");
+      return false;
+    }
+    const blob = encodeWavPcm16(buffer);
+    downloadBlob(blob, "export.wav");
+    this.setStatus("已导出整段 WAV");
+    return true;
+  }
+
+  private formatBufferStatus(buffer: AudioBuffer): string {
+    return `${buffer.numberOfChannels} ch · ${buffer.sampleRate} Hz · ${buffer.duration.toFixed(2)}s`;
+  }
+
+  private async applyEditedBuffer(
+    next: AudioBuffer,
+    opts: {
+      recordHistory: boolean;
+      playheadSample?: number;
+      selection?: { startSample: number; endSample: number } | null;
+    },
+  ): Promise<void> {
+    const current = this.transport.getBuffer();
+    if (!current || this.editBusy) return;
+
+    const stateBefore = this.store.getSnapshot();
+    const wasPlaying =
+      this.transport.isPlaying() || stateBefore.transport === "playing";
+    // 播放中用实时游标，避免时钟与 store 有一帧偏差
+    const livePlayhead = wasPlaying
+      ? this.transport.getCurrentSample()
+      : stateBefore.playheadSample;
+
+    this.editBusy = true;
+    try {
+      if (opts.recordHistory) {
+        this.editHistory.push(current);
+      }
+
+      this.transport.setBuffer(next, { syncTransport: false });
+
+      const length = next.length;
+      let vpStart = stateBefore.viewport.startSample;
+      let vpEnd = stateBefore.viewport.endSample;
+      const vpDur = Math.max(1, vpEnd - vpStart);
+      if (vpEnd > length) {
+        vpEnd = length;
+        vpStart = Math.max(0, vpEnd - vpDur);
+      }
+      if (vpStart >= length) {
+        vpStart = 0;
+        vpEnd = length;
+      }
+      if (vpEnd <= vpStart) {
+        vpStart = 0;
+        vpEnd = Math.max(1, length);
+      }
+
+      const playhead = Math.max(
+        0,
+        Math.min(length, opts.playheadSample ?? livePlayhead),
+      );
+
+      this.store.patch({
+        lengthSamples: length,
+        channelCount: next.numberOfChannels,
+        sampleRate: next.sampleRate,
+        playheadSample: playhead,
+        viewport: { startSample: vpStart, endSample: vpEnd },
+        selection: opts.selection === undefined ? stateBefore.selection : opts.selection,
+        transport: wasPlaying ? "playing" : stateBefore.transport === "playing" ? "paused" : stateBefore.transport,
+      });
+
+      // 换 buffer 会短暂打断声源；若原先在播，立刻从新游标续播，再后台重分析。
+      if (wasPlaying) {
+        await this.transport.play(playhead);
+      }
+
+      // 分析在后台进行，不打断播放；不置 isLoading，避免全屏遮罩
+      await this.reanalyzeAndBake(next);
+      this.setStatus(this.formatBufferStatus(next));
+      this.needRender = true;
+      this.updateChrome();
+      void this.transport.prewarmRates(playhead);
+    } finally {
+      this.editBusy = false;
+    }
+  }
+
+  private async reanalyzeAndBake(buffer: AudioBuffer): Promise<void> {
+    this.bus.emit("loadprogress", {
+      stage: "analyze",
+      progress: 0.85,
+      message: "Analyzing…",
+    });
+    this.setStatus("Analyzing (worker)…");
+
+    const channelCount = buffer.numberOfChannels;
+    const channelData: Float32Array[] = [];
+    const transferables: Transferable[] = [];
+    for (let ch = 0; ch < channelCount; ch++) {
+      const copy = new Float32Array(buffer.getChannelData(ch));
+      channelData.push(copy);
+      transferables.push(copy.buffer);
+    }
+
+    const durationSec = buffer.duration;
+    let analyzeHop = this.hop;
+    let maxFrames = 4096;
+    if (durationSec > 600) {
+      analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 4));
+      maxFrames = 2048;
+    } else if (durationSec > 180) {
+      analyzeHop = Math.max(analyzeHop, Math.floor(this.fftSize / 6));
+      maxFrames = 3072;
+    } else if (durationSec > 60) {
+      maxFrames = 4096;
+    } else {
+      maxFrames = 6144;
+    }
+
+    type SpectrogramDataPayload = {
+      bins: number;
+      frames: number;
+      magnitudes: Float32Array;
+      fftSize: number;
+      hop: number;
+      sampleRate: number;
+    };
+
+    type WorkerResponse = {
+      peaks: { peaksLevels: Float32Array[][] };
+      spectrogram: { channelCount: number; data: SpectrogramDataPayload[] };
+    };
+
+    const worker = new Worker(
+      new URL("../workers/analysis.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+
+    const response = (await new Promise<WorkerResponse>((resolve, reject) => {
+      worker.onmessage = (ev: MessageEvent<WorkerResponse>) => resolve(ev.data);
+      worker.onerror = (err) => reject(err);
+      worker.postMessage(
+        {
+          kind: "analyze",
+          channelData,
+          sampleRate: buffer.sampleRate,
+          fftSize: this.fftSize,
+          hop: analyzeHop,
+          maxFrames,
+        },
+        transferables,
+      );
+    })) as WorkerResponse;
+
+    worker.terminate();
+
+    this.peaks = new WaveformPeaks(buffer, { levels: response.peaks.peaksLevels });
+    this.spectrograms = new SpectrogramFrames({
+      channelCount: response.spectrogram.channelCount,
+      data: response.spectrogram.data,
+    });
+    this.spectrogramBitmaps.dispose();
+    this.axisLayoutKey = "";
+
+    const stateAfter = this.store.getSnapshot();
+    this.bus.emit("loadprogress", {
+      stage: "analyze",
+      progress: 0.95,
+      message: "Baking spectrogram…",
+    });
+    this.setStatus("Baking spectrogram…");
+    await this.spectrogramBitmaps.bake(
+      this.spectrograms,
+      stateAfter.spectrogramMinDb,
+      stateAfter.spectrogramMaxDb,
+    );
+  }
+
   private destroyDom(): void {
     if (this.keyHandler) {
       window.removeEventListener("keydown", this.keyHandler);
@@ -394,6 +771,10 @@ export class AudioPlayerControl {
     this.root = null;
     this.spectrogramBitmaps.dispose();
     this.axisLayoutKey = "";
+    if (this.recording) {
+      void this.recorder.stop({ finalize: false });
+      this.recording = false;
+    }
   }
 
   private buildDom(): DocumentFragment {
@@ -406,6 +787,16 @@ export class AudioPlayerControl {
       <button type="button" data-act="back" title="快退（Shift+←）">快退</button>
       <button type="button" data-act="fwd" title="快进（Shift+→）">快进</button>
       <button type="button" data-act="fit" title="适配全长">适配</button>
+      <label>录音时长
+        <select data-act="rec-dur" title="固定时长：整段一屏显示，波形从左生长">
+          <option value="60">1 分钟</option>
+          <option value="300" selected>5 分钟</option>
+          <option value="600">10 分钟</option>
+          <option value="1800">30 分钟</option>
+        </select>
+      </label>
+      <button type="button" data-act="rec-start" title="开始麦克风录音">录音</button>
+      <button type="button" data-act="rec-stop" title="停止录音" disabled>停录</button>
       <button type="button" data-act="wave" data-view="waveform" class="active">波形</button>
       <button type="button" data-act="spec" data-view="spectrogram">语谱</button>
       <label>通道
@@ -436,6 +827,14 @@ export class AudioPlayerControl {
       <label>增益 <input data-act="gain" type="range" min="0.2" max="4" step="0.05" value="1" /></label>
       <label>dB 最小 <input data-act="mindb" type="number" value="-100" style="width:56px" /></label>
       <label>dB 最大 <input data-act="maxdb" type="number" value="-5" style="width:56px" /></label>
+      <button type="button" data-act="cut" title="剪切选区（Ctrl/⌘+X）">剪切</button>
+      <button type="button" data-act="copy" title="复制选区（Ctrl/⌘+C）">复制</button>
+      <button type="button" data-act="paste" title="粘贴（Ctrl/⌘+V）">粘贴</button>
+      <button type="button" data-act="delete-sel" title="删除选区（Delete）">删除</button>
+      <button type="button" data-act="undo" title="撤销（Ctrl/⌘+Z）">撤销</button>
+      <button type="button" data-act="redo" title="重做（Ctrl/⌘+Shift+Z）">重做</button>
+      <button type="button" data-act="export-sel" title="导出选区 WAV">导出选区</button>
+      <button type="button" data-act="export-all" title="导出整段 WAV">导出整段</button>
       <button type="button" data-act="clear-sel">清除选区</button>
       <span class="apc-clock">00:00.000</span>
     `;
@@ -449,9 +848,9 @@ export class AudioPlayerControl {
     const wrap = document.createElement("div");
     wrap.className = "apc-main-wrap";
     // Spectrogram bitmap layer (behind): zoom/pan = drawImage crop
-    const gl = document.createElement("canvas");
-    gl.className = "apc-main apc-main-gl";
-    wrap.appendChild(gl);
+    const spec = document.createElement("canvas");
+    spec.className = "apc-main apc-main-spec";
+    wrap.appendChild(spec);
     // Axis/label static 2D layer (keeps frequency axis + lane labels stable)
     const axis = document.createElement("canvas");
     axis.className = "apc-main apc-axis-2d";
@@ -476,6 +875,16 @@ export class AudioPlayerControl {
     root.querySelector('[data-act="back"]')?.addEventListener("click", () => this.skipBackward());
     root.querySelector('[data-act="fwd"]')?.addEventListener("click", () => this.skipForward());
     root.querySelector('[data-act="fit"]')?.addEventListener("click", () => this.fit());
+    root.querySelector('[data-act="rec-start"]')?.addEventListener("click", () => {
+      void this.startRecording(this.recordDurationSec);
+    });
+    root.querySelector('[data-act="rec-stop"]')?.addEventListener("click", () => {
+      void this.stopRecording();
+    });
+    const recDur = root.querySelector('[data-act="rec-dur"]') as HTMLSelectElement | null;
+    recDur?.addEventListener("change", () => {
+      this.recordDurationSec = Number(recDur.value) || 300;
+    });
     root.querySelector('[data-act="wave"]')?.addEventListener("click", () =>
       this.setViewMode("waveform"),
     );
@@ -484,6 +893,30 @@ export class AudioPlayerControl {
     );
     root.querySelector('[data-act="clear-sel"]')?.addEventListener("click", () => {
       this.store.patch({ selection: null });
+    });
+    root.querySelector('[data-act="cut"]')?.addEventListener("click", () => {
+      void this.cutSelection();
+    });
+    root.querySelector('[data-act="copy"]')?.addEventListener("click", () => {
+      this.copySelection();
+    });
+    root.querySelector('[data-act="paste"]')?.addEventListener("click", () => {
+      void this.pasteClipboard();
+    });
+    root.querySelector('[data-act="delete-sel"]')?.addEventListener("click", () => {
+      void this.deleteSelection();
+    });
+    root.querySelector('[data-act="undo"]')?.addEventListener("click", () => {
+      void this.undo();
+    });
+    root.querySelector('[data-act="redo"]')?.addEventListener("click", () => {
+      void this.redo();
+    });
+    root.querySelector('[data-act="export-sel"]')?.addEventListener("click", () => {
+      this.exportSelection();
+    });
+    root.querySelector('[data-act="export-all"]')?.addEventListener("click", () => {
+      this.exportAll();
     });
 
     const channel = root.querySelector('[data-act="channel"]') as HTMLSelectElement | null;
@@ -582,7 +1015,47 @@ export class AudioPlayerControl {
     const tag = (e.target as HTMLElement | null)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
 
+    const mod = e.metaKey || e.ctrlKey;
     const state = this.store.getSnapshot();
+
+    if (mod && e.code === "KeyX") {
+      e.preventDefault();
+      void this.cutSelection();
+      return;
+    }
+    if (mod && e.code === "KeyC") {
+      e.preventDefault();
+      this.copySelection();
+      return;
+    }
+    if (mod && e.code === "KeyV") {
+      e.preventDefault();
+      void this.pasteClipboard();
+      return;
+    }
+    if (mod && e.code === "KeyZ" && e.shiftKey) {
+      e.preventDefault();
+      void this.redo();
+      return;
+    }
+    if (mod && e.code === "KeyY") {
+      e.preventDefault();
+      void this.redo();
+      return;
+    }
+    if (mod && e.code === "KeyZ") {
+      e.preventDefault();
+      void this.undo();
+      return;
+    }
+    if (e.code === "Delete" || e.code === "Backspace") {
+      if (state.selection) {
+        e.preventDefault();
+        void this.deleteSelection();
+      }
+      return;
+    }
+
     if (e.code === "Space") {
       e.preventDefault();
       void this.togglePlay();
@@ -632,6 +1105,33 @@ export class AudioPlayerControl {
     const playBtn = this.root?.querySelector('[data-act="play"]') as HTMLButtonElement | null;
     if (playBtn) playBtn.textContent = state.transport === "playing" ? "暂停" : "播放";
 
+    const setDisabled = (act: string, disabled: boolean) => {
+      const btn = this.root?.querySelector(`[data-act="${act}"]`) as HTMLButtonElement | null;
+      if (btn) btn.disabled = disabled;
+    };
+    const hasBuffer = !!this.transport.getBuffer() && !this.recording;
+    const hasSel = !!normalizeEditRange(state.selection, state.lengthSamples);
+    const busy = this.editBusy || this.isLoading || this.recording;
+    setDisabled("cut", busy || !hasBuffer || !hasSel);
+    setDisabled("copy", busy || !hasBuffer || !hasSel);
+    setDisabled("paste", busy || !hasBuffer || !this.clipboard);
+    setDisabled("delete-sel", busy || !hasBuffer || !hasSel);
+    setDisabled("undo", busy || !this.editHistory.canUndo);
+    setDisabled("redo", busy || !this.editHistory.canRedo);
+    setDisabled("export-sel", busy || !hasBuffer || !hasSel);
+    setDisabled("export-all", busy || !hasBuffer);
+    setDisabled("play", this.recording);
+    setDisabled("stop", this.recording);
+    setDisabled("back", this.recording);
+    setDisabled("fwd", this.recording);
+    setDisabled("spec", this.recording);
+    setDisabled("rec-start", this.recording || this.editBusy || this.isLoading);
+    setDisabled("rec-stop", !this.recording);
+    setDisabled("rec-dur", this.recording);
+
+    const recStart = this.root?.querySelector('[data-act="rec-start"]') as HTMLButtonElement | null;
+    if (recStart) recStart.textContent = this.recording ? "录音中…" : "录音";
+
     const waveBtn = this.root?.querySelector('[data-act="wave"]');
     const specBtn = this.root?.querySelector('[data-act="spec"]');
     waveBtn?.classList.toggle("active", state.viewMode === "waveform");
@@ -665,7 +1165,7 @@ export class AudioPlayerControl {
 
     // 只移除语谱图模式的 minimap：波形模式仍保留概览条。
     if (this.overviewCanvas) {
-      const hide = state.viewMode === "spectrogram";
+      const hide = state.viewMode === "spectrogram" || this.recording;
       this.overviewCanvas.style.display = hide ? "none" : "";
       this.overviewCanvas.style.pointerEvents = hide ? "none" : "";
     }
@@ -723,7 +1223,9 @@ export class AudioPlayerControl {
 
   private startLoop(): void {
     const loop = () => {
-      if (this.needRender) {
+      if (this.recording) {
+        this.render();
+      } else if (this.needRender) {
         if (
           this.spectrogramViewportOnly &&
           this.store.getSnapshot().viewMode === "spectrogram" &&
@@ -736,7 +1238,12 @@ export class AudioPlayerControl {
         this.needRender = false;
         this.spectrogramViewportOnly = false;
       } else if (this.store.getSnapshot().transport === "playing") {
-        this.renderOverlaysOnly();
+        if (this.store.getSnapshot().viewMode === "spectrogram") {
+          this.renderOverlaysOnly();
+        } else {
+          // 波形播放：同 canvas 全量重绘游标
+          this.render();
+        }
       }
       this.raf = requestAnimationFrame(loop);
     };
@@ -751,7 +1258,11 @@ export class AudioPlayerControl {
   private render(): void {
     if (!this.mainCanvas || !this.rulerCanvas || !this.overviewCanvas) return;
     const state = this.store.getSnapshot();
-    if (!this.peaks || state.channelCount === 0) {
+    const livePeaks = this.recording ? this.recorder.getPeaks() : null;
+    const liveBuffer = this.recording ? this.recorder.getBuffer() : null;
+    const peaksSource: PeaksQueryable | null = livePeaks ?? this.peaks;
+
+    if ((!peaksSource && !this.recording) || state.channelCount === 0) {
       const ctx = this.mainCanvas.getContext("2d");
       if (ctx) {
         const dpr = window.devicePixelRatio || 1;
@@ -781,16 +1292,28 @@ export class AudioPlayerControl {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const axisW = state.viewMode === "spectrogram" ? 36 : 0;
+    // 录音：强制整段计划时长一屏显示（忽略用户缩放）
+    const viewStart = this.recording ? 0 : state.viewport.startSample;
+    const viewEnd = this.recording
+      ? Math.max(1, liveBuffer?.length ?? state.lengthSamples)
+      : state.viewport.endSample;
+    const playheadSample = this.recording
+      ? this.recorder.getWriteHead()
+      : state.playheadSample;
+
+    const axisW = !this.recording && state.viewMode === "spectrogram" ? 36 : 0;
     this.mapper = new ViewportMapper({
-      sampleRate: state.sampleRate,
-      startSample: state.viewport.startSample,
-      endSample: state.viewport.endSample,
+      sampleRate: state.sampleRate || this.audioContext.sampleRate,
+      startSample: viewStart,
+      endSample: viewEnd,
       width: Math.max(1, width - axisW),
       offsetX: axisW,
     });
 
-    this.lanes = this.laneLayout.compute(state.laneHeights, height);
+    this.lanes = this.laneLayout.compute(
+      state.laneHeights.length ? state.laneHeights : [1],
+      height,
+    );
     this.timeRuler?.render(this.mapper, dpr);
 
     let dimChannels: Set<number> | null = null;
@@ -801,30 +1324,32 @@ export class AudioPlayerControl {
       }
     }
 
-    if (state.viewMode === "waveform") {
-      if (this.glCanvas) this.glCanvas.style.visibility = "hidden";
+    if (this.recording || state.viewMode === "waveform") {
+      if (this.spectrogramCanvas) this.spectrogramCanvas.style.visibility = "hidden";
       if (this.axisCanvas) this.axisCanvas.style.visibility = "hidden";
-      this.waveformRenderer.render(ctx, this.peaks, this.mapper, this.lanes, {
-        gains: state.waveformGain,
-        dimChannels,
-        channelCount: state.channelCount,
-      });
+      if (peaksSource) {
+        this.waveformRenderer.render(ctx, peaksSource, this.mapper, this.lanes, {
+          gains: state.waveformGain.length ? state.waveformGain : [1],
+          dimChannels,
+          channelCount: Math.max(1, state.channelCount),
+        });
+      }
     } else if (this.spectrograms) {
       // === 语谱：底层 canvas 只做整图裁剪 blit；缩放不再重算颜色 ===
-      if (!this.glCanvas || !this.axisCanvas) return;
-      this.glCanvas.style.visibility = "visible";
+      if (!this.spectrogramCanvas || !this.axisCanvas) return;
+      this.spectrogramCanvas.style.visibility = "visible";
       this.axisCanvas.style.visibility = "visible";
 
-      const glW = Math.max(1, Math.floor(width * dpr));
-      const glH = Math.max(1, Math.floor(height * dpr));
-      if (this.glCanvas.width !== glW) this.glCanvas.width = glW;
-      if (this.glCanvas.height !== glH) this.glCanvas.height = glH;
+      const specW = Math.max(1, Math.floor(width * dpr));
+      const specH = Math.max(1, Math.floor(height * dpr));
+      if (this.spectrogramCanvas.width !== specW) this.spectrogramCanvas.width = specW;
+      if (this.spectrogramCanvas.height !== specH) this.spectrogramCanvas.height = specH;
 
-      const glCtx = this.glCanvas.getContext("2d");
-      if (!glCtx) return;
-      glCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      glCtx.fillStyle = "#0c0e12";
-      glCtx.fillRect(0, 0, width, height);
+      const specCtx = this.spectrogramCanvas.getContext("2d");
+      if (!specCtx) return;
+      specCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      specCtx.fillStyle = "#0c0e12";
+      specCtx.fillRect(0, 0, width, height);
 
       if (
         this.spectrogramBitmaps.needsBake(
@@ -837,12 +1362,12 @@ export class AudioPlayerControl {
       }
 
       if (this.spectrogramBitmaps.ready) {
-        glCtx.imageSmoothingEnabled = true;
-        glCtx.imageSmoothingQuality = "high";
+        specCtx.imageSmoothingEnabled = true;
+        specCtx.imageSmoothingQuality = "high";
         for (const lane of this.lanes) {
           const dim = dimChannels?.has(lane.channel) ?? false;
           this.spectrogramBitmaps.drawLane(
-            glCtx,
+            specCtx,
             lane.channel,
             lane,
             axisW,
@@ -859,7 +1384,6 @@ export class AudioPlayerControl {
           maxDb: state.spectrogramMaxDb,
           dimChannels,
           channelCount: state.channelCount,
-          drawFrequencyAxis: false,
         });
       }
 
@@ -934,15 +1458,15 @@ export class AudioPlayerControl {
     this.playheadOverlay.render(
       ctx,
       this.mapper,
-      state.playheadSample,
-      state.selection,
+      playheadSample,
+      this.recording ? null : state.selection,
       height,
     );
 
     const octx = this.overviewCanvas.getContext("2d");
     if (octx) {
-      // 语谱图模式不渲染 minimap（renderer 清掉旧内容，避免切换瞬间残影）。
-      if (state.viewMode === "waveform") {
+      // 语谱图模式不渲染 minimap；录音中也不画（整段一屏即可）
+      if (state.viewMode === "waveform" && !this.recording && this.peaks) {
         this.overviewRenderer.render(
           octx,
           this.peaks,
@@ -963,7 +1487,7 @@ export class AudioPlayerControl {
 
   /** 缩放/平移/跟随专用：只裁剪 blit 整图 + 时间尺 + 游标，不重画频率轴、不重算颜色。 */
   private renderSpectrogramViewportFast(): void {
-    if (!this.mainCanvas || !this.glCanvas || !this.spectrogramBitmaps.ready) {
+    if (!this.mainCanvas || !this.spectrogramCanvas || !this.spectrogramBitmaps.ready) {
       this.render();
       return;
     }
@@ -995,10 +1519,10 @@ export class AudioPlayerControl {
     }
     this.timeRuler?.render(this.mapper, dpr);
 
-    const glW = Math.max(1, Math.floor(width * dpr));
-    const glH = Math.max(1, Math.floor(height * dpr));
-    if (this.glCanvas.width !== glW) this.glCanvas.width = glW;
-    if (this.glCanvas.height !== glH) this.glCanvas.height = glH;
+    const specW = Math.max(1, Math.floor(width * dpr));
+    const specH = Math.max(1, Math.floor(height * dpr));
+    if (this.spectrogramCanvas.width !== specW) this.spectrogramCanvas.width = specW;
+    if (this.spectrogramCanvas.height !== specH) this.spectrogramCanvas.height = specH;
 
     let dimChannels: Set<number> | null = null;
     if (state.playChannelMode.kind === "solo") {
@@ -1008,17 +1532,17 @@ export class AudioPlayerControl {
       }
     }
 
-    const glCtx = this.glCanvas.getContext("2d");
-    if (!glCtx) return;
-    glCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    glCtx.fillStyle = "#0c0e12";
-    glCtx.fillRect(0, 0, width, height);
-    glCtx.imageSmoothingEnabled = true;
-    glCtx.imageSmoothingQuality = "high";
+    const specCtx = this.spectrogramCanvas.getContext("2d");
+    if (!specCtx) return;
+    specCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    specCtx.fillStyle = "#0c0e12";
+    specCtx.fillRect(0, 0, width, height);
+    specCtx.imageSmoothingEnabled = true;
+    specCtx.imageSmoothingQuality = "high";
     for (const lane of this.lanes) {
       const dim = dimChannels?.has(lane.channel) ?? false;
       this.spectrogramBitmaps.drawLane(
-        glCtx,
+        specCtx,
         lane.channel,
         lane,
         axisW,
@@ -1052,7 +1576,7 @@ export class AudioPlayerControl {
     const state = this.store.getSnapshot();
     // 波形与游标共用同一 canvas，只能全量重绘。
     if (state.viewMode !== "spectrogram" || !this.mapper || this.lanes.length === 0) {
-      this.needRender = true;
+      this.render();
       return;
     }
 

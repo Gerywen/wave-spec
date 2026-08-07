@@ -24,8 +24,4 @@ export class EventBus<Events extends Record<string, unknown[]>> {
       (handler as Handler<Events[K]>)(...args);
     }
   }
-
-  clear(): void {
-    this.listeners.clear();
-  }
 }

@@ -107,7 +107,7 @@
   cursor: crosshair;
 }
 
-.apc-main-gl {
+.apc-main-spec {
   z-index: 1;
   pointer-events: none;
 }
@@ -127,14 +127,4 @@
   display: block;
   border-top: 1px solid var(--apc-border);
   cursor: pointer;
-}
-
-.apc-split-hint {
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 6px;
-  margin-top: -3px;
-  cursor: row-resize;
-  pointer-events: none;
 }
