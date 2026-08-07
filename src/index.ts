@@ -7,6 +7,7 @@ export type {
   PlayerState,
   PlayerStatePatch,
   AudioPlayerControlOptions,
+  ToolbarGroup,
   LoadProgress,
   ChannelLabel,
 } from "./types.js";

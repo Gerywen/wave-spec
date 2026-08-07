@@ -57,6 +57,10 @@
   cursor: not-allowed;
 }
 
+.apc-toolbar [hidden] {
+  display: none !important;
+}
+
 .apc-toolbar label {
   display: inline-flex;
   align-items: center;

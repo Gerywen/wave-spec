@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>APC overview capture</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0e1116;
+      }
+      .apc-root {
+        --apc-bg: #0e1116;
+        --apc-panel: #161a22;
+        --apc-border: #2a303c;
+        --apc-text: #d7deea;
+        --apc-muted: #8b95a8;
+        --apc-accent: #4aa3ff;
+        display: flex;
+        flex-direction: column;
+        width: 1200px;
+        height: 560px;
+        background: var(--apc-bg);
+        color: var(--apc-text);
+        font-family: "IBM Plex Sans", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+        border: 1px solid var(--apc-border);
+        border-radius: 8px;
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+      .apc-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+        padding: 8px 10px;
+        background: var(--apc-panel);
+        border-bottom: 1px solid var(--apc-border);
+      }
+      .apc-toolbar button,
+      .apc-toolbar select {
+        appearance: none;
+        border: 1px solid var(--apc-border);
+        background: #1c2230;
+        color: var(--apc-text);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+      .apc-toolbar button.active {
+        background: #243147;
+        border-color: var(--apc-accent);
+        color: #fff;
+      }
+      .apc-toolbar label {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--apc-muted);
+      }
+      .apc-toolbar input[type="range"] {
+        width: 80px;
+      }
+      .apc-clock {
+        margin-left: auto;
+        font-variant-numeric: tabular-nums;
+        font-size: 13px;
+        color: #e8eef8;
+        min-width: 96px;
+        text-align: right;
+      }
+      .apc-status {
+        font-size: 12px;
+        color: var(--apc-muted);
+        padding: 0 10px 6px;
+      }
+      .apc-ruler {
+        height: 28px;
+        width: 100%;
+        display: block;
+        background: #1a1d23;
+      }
+      .apc-main-wrap {
+        position: relative;
+        flex: 1;
+        min-height: 180px;
+      }
+      .apc-main {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .apc-overview {
+        height: 48px;
+        width: 100%;
+        display: block;
+        border-top: 1px solid var(--apc-border);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="apc-root" id="root">
+      <div class="apc-toolbar">
+        <button type="button">播放</button>
+        <button type="button">停止</button>
+        <button type="button">快退</button>
+        <button type="button">快进</button>
+        <button type="button">适配</button>
+        <button type="button" class="active">波形</button>
+        <button type="button">语谱</button>
+        <label
+          >通道
+          <select>
+            <option>原声</option>
+          </select>
+        </label>
+        <label
+          >倍速
+          <select>
+            <option>1×</option>
+          </select>
+        </label>
+        <label>音量 <input type="range" min="0" max="1" step="0.01" value="1" /></label>
+        <label><input type="checkbox" checked /> 跟随</label>
+        <span class="apc-clock">00:12.450</span>
+      </div>
+      <div class="apc-status">2 ch · 44100 Hz · 8.00s</div>
+      <canvas class="apc-ruler" id="ruler" width="1200" height="28"></canvas>
+      <div class="apc-main-wrap">
+        <canvas class="apc-main" id="main" width="1200" height="400"></canvas>
+      </div>
+      <canvas class="apc-overview" id="overview" width="1200" height="48"></canvas>
+    </div>
+    <script>
+      function waveY(t, lane) {
+        const f0 = lane === 0 ? 2.2 : 3.1;
+        const env = 0.55 + 0.35 * Math.sin(t * 1.7 + lane);
+        return (
+          env *
+          (0.55 * Math.sin(t * Math.PI * 2 * f0) +
+            0.25 * Math.sin(t * Math.PI * 2 * f0 * 2.1) +
+            0.12 * Math.sin(t * Math.PI * 2 * (f0 + 0.4)))
+        );
+      }
+
+      function drawRuler(canvas) {
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = "#1a1d23";
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = "#2a303c";
+        ctx.beginPath();
+        ctx.moveTo(0, h - 0.5);
+        ctx.lineTo(w, h - 0.5);
+        ctx.stroke();
+        ctx.fillStyle = "#8b95a8";
+        ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+        for (let i = 0; i <= 8; i++) {
+          const x = (i / 8) * w;
+          ctx.strokeStyle = "#2a303c";
+          ctx.beginPath();
+          ctx.moveTo(x + 0.5, h - 10);
+          ctx.lineTo(x + 0.5, h);
+          ctx.stroke();
+          ctx.fillText(`0:0${i}`, x + 4, 14);
+        }
+      }
+
+      function drawMain(canvas) {
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = "#0e1116";
+        ctx.fillRect(0, 0, w, h);
+
+        const laneH = h / 2;
+        const selA = w * 0.34;
+        const selB = w * 0.58;
+        const playX = w * 0.22;
+
+        for (let lane = 0; lane < 2; lane++) {
+          const y0 = lane * laneH;
+          const mid = y0 + laneH / 2;
+          ctx.fillStyle = lane === 0 ? "#12161d" : "#0e1116";
+          ctx.fillRect(0, y0, w, laneH);
+          ctx.strokeStyle = "#2a303c";
+          ctx.beginPath();
+          ctx.moveTo(0, y0 + laneH - 0.5);
+          ctx.lineTo(w, y0 + laneH - 0.5);
+          ctx.stroke();
+
+          ctx.fillStyle = "rgba(74, 163, 255, 0.14)";
+          ctx.fillRect(selA, y0, selB - selA, laneH);
+
+          ctx.strokeStyle = "#2a303c";
+          ctx.beginPath();
+          ctx.moveTo(36, mid + 0.5);
+          ctx.lineTo(w, mid + 0.5);
+          ctx.stroke();
+
+          ctx.beginPath();
+          for (let x = 36; x < w; x++) {
+            const t = x / w;
+            const amp = waveY(t * 8, lane) * (laneH * 0.38);
+            const y = mid - amp;
+            if (x === 36) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          for (let x = w - 1; x >= 36; x--) {
+            const t = x / w;
+            const amp = waveY(t * 8, lane) * (laneH * 0.38);
+            ctx.lineTo(x, mid + amp);
+          }
+          ctx.closePath();
+          ctx.fillStyle = "rgba(74, 163, 255, 0.55)";
+          ctx.fill();
+          ctx.strokeStyle = "#4aa3ff";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+
+          ctx.fillStyle = "#8b95a8";
+          ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+          ctx.fillText(lane === 0 ? "L" : "R", 10, mid + 4);
+        }
+
+        ctx.strokeStyle = "#ff7a3c";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(playX + 0.5, 0);
+        ctx.lineTo(playX + 0.5, h);
+        ctx.stroke();
+      }
+
+      function drawOverview(canvas) {
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = "#161a22";
+        ctx.fillRect(0, 0, w, h);
+        const mid = h / 2;
+        ctx.beginPath();
+        for (let x = 0; x < w; x++) {
+          const t = x / w;
+          const amp = Math.abs(waveY(t * 8, 0)) * (h * 0.35);
+          if (x === 0) ctx.moveTo(x, mid - amp);
+          else ctx.lineTo(x, mid - amp);
+        }
+        for (let x = w - 1; x >= 0; x--) {
+          const t = x / w;
+          const amp = Math.abs(waveY(t * 8, 0)) * (h * 0.35);
+          ctx.lineTo(x, mid + amp);
+        }
+        ctx.closePath();
+        ctx.fillStyle = "rgba(74, 163, 255, 0.35)";
+        ctx.fill();
+
+        const vx = w * 0.08;
+        const vw = w * 0.42;
+        ctx.strokeStyle = "#4aa3ff";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(vx + 0.5, 4.5, vw, h - 9);
+        ctx.fillStyle = "rgba(74, 163, 255, 0.08)";
+        ctx.fillRect(vx, 4, vw, h - 8);
+      }
+
+      drawRuler(document.getElementById("ruler"));
+      drawMain(document.getElementById("main"));
+      drawOverview(document.getElementById("overview"));
+      document.documentElement.dataset.ready = "1";
+    </script>
+  </body>
+</html>

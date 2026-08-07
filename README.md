@@ -1,116 +1,177 @@
+English | [简体中文](./README.zh-CN.md)
+
 # playback-controls / audio-player-control
 
-多分轨波形 / 语谱音频播放控件（TypeScript 库 + Vite Demo + Rust/WASM 分析）。
+Multi-lane waveform / spectrogram audio player control (TypeScript library + Vite demos + Rust/WASM analysis).
 
-仓库：https://gitee.com/lantuyuntuo/playback-controls
+Repository: https://gitee.com/lantuyuntuo/playback-controls
 
-## 功能
+## Features
 
-- 单声道 / 立体声 / 多声道分轨显示（上 L / 下 R …）
-- 波形 ↔ 语谱切换（语谱：一次烘焙 ImageBitmap，缩放/平移只做裁剪）
-- 时间尺、缩放、平移、游标、选区
-- 剪切 / 复制 / 粘贴 / 删除选区；撤销 / 重做（缓冲快照）
-- 导出选区 / 整段为 WAV（16-bit PCM）
-- 固定时长麦克风录音：整段时间轴一屏显示，波形从左向右生长；停录后进入编辑管线
-- 波形模式底部概览条（语谱模式暂不显示 minimap）
-- 播放 / 暂停 / 停止回 0 / 定步长快进快退
-- Original / Mono / Solo 通道路由
-- 变速不变调（WSOLA，Rust/WASM；按约 45s 窗口分段拉伸 + 常用倍率预热）
-- 波形 peaks + 语谱 STFT 在 WebWorker + WASM 中计算
+- Mono / stereo / multi-channel lane display (L on top / R below, …)
+- Waveform ↔ spectrogram (spectrogram baked once to `ImageBitmap`; zoom/pan only crops)
+- Time ruler, zoom, pan, playhead, selection
+- Cut / copy / paste / delete selection; undo / redo (buffer snapshots)
+- Export selection or full buffer as 16-bit PCM WAV
+- Fixed-duration mic recording: full timeline on one screen, waveform grows left→right; enters edit pipeline after stop
+- Overview minimap in waveform mode (hidden in spectrogram mode)
+- Play / pause / stop-to-0 / stepped skip forward & back
+- Original / Mono / Solo channel routing
+- Time-stretch without pitch shift (WSOLA via Rust/WASM; ~45s windows + common-rate prewarm)
+- Waveform peaks + spectrogram STFT in WebWorker + WASM
 
-## 开发
+## Development
 
 ```bash
 npm install
+
+# Legacy single-page demo tutorial
 npm run dev
+
+# React examples site: one page per feature (recommended for demos)
+npm run site:dev
 ```
 
-浏览器打开后可「打开音频」或点「生成测试音」。
+### React examples site (`site/`)
 
-### 重新构建 WASM（可选）
+Similar to Wavesurfer Examples: left nav + right demo; overview home + per-feature routes.  
+**zh / EN toggle**: language buttons at the top of the sidebar (preference saved in `localStorage`).
 
-需要本机已安装 Rust 与 `wasm-pack`：
+| Path | Content |
+|------|---------|
+| `/` | Overview |
+| `/api` | **Full API reference** (constructor options, method params, store, events) |
+| `/examples/basic` | Basic playback |
+| `/examples/waveform-spectrogram` | Waveform / spectrogram |
+| `/examples/selection` | Selection & navigation |
+| `/examples/edit` | Cut / copy / paste / delete |
+| `/examples/export` | Export WAV |
+| `/examples/rate` | Time-stretch (WSOLA) |
+| `/examples/channels` | Channel routing |
+| `/examples/play-selection` | Play selection only |
+| `/examples/record` | Fixed-duration recording |
+
+Default port `5174`. Build: `npm run site:build` → `dist-site/`.
+
+Control logic lives in `src/`; the long single-page tutorial is under `demo/`.
+
+### Rebuild WASM (optional)
+
+Requires Rust and `wasm-pack` locally:
 
 ```bash
 cd rust/crates/wasm-analyzer
 wasm-pack build --target web --out-dir ../../../src/wasm
 ```
 
-日常改 TS/渲染一般不必重建；改了 `rust/crates/dsp` 或 `wasm-analyzer` 后才需要。
+Usually unnecessary for TS/render changes; rebuild after editing `rust/crates/dsp` or `wasm-analyzer`.
 
-## 构建
+## Build
 
 ```bash
 # Demo
 npm run build
 
-# 可发布库（输出 dist/）
+# Publishable library → dist/
 npm run build:lib
 ```
 
-## 使用
+## Usage
 
 ```ts
 import { AudioPlayerControl } from "audio-player-control";
 import "audio-player-control/style.css";
 
 const player = new AudioPlayerControl({
-  skipSeconds: 5,
-  spectrogramFftSize: 4096,
+  skipSeconds: 5,              // skip step in seconds (default 5)
+  playbackRate: 1,             // initial rate (default 1, WSOLA)
+  followPlayhead: true,        // viewport follows playhead while playing
+  snapToZeroCrossing: true,    // snap selection/clicks to zero-crossings
+  spectrogramFftSize: 4096,    // spectrogram FFT (ctor-only)
+  spectrogramHop: 512,         // spectrogram hop (ctor-only)
+  toolbar: "all",              // or ["transport","rate",…] to show a subset
 });
 player.mount(document.getElementById("root")!);
-await player.load(file);
+await player.load(file);       // File | Blob | URL | ArrayBuffer | AudioBuffer
+
+await player.play();
+player.setViewMode("spectrogram");
+player.setPlayChannelMode({ kind: "solo", channel: 0 });
+player.store.patch({ playbackRate: 1.5, playSelectionOnly: true });
+
+player.bus.on("ready", () => { /* ready to play */ });
+player.bus.on("loadprogress", (p) => { /* p.stage / p.progress */ });
+player.bus.on("error", (err) => console.error(err));
 ```
 
-### 主要快捷键
+Full parameter tables live at **`/api`** on the examples site (`npm run site:dev` → sidebar **API Reference**, switchable zh/EN).
 
-| 按键 | 作用 |
-|------|------|
-| Space | 播放/暂停 |
-| ← / → | 微调游标 |
-| Shift+← / → | 快退/快进 |
-| Home / End | 到开头/结尾 |
-| W / S | 波形 / 语谱 |
+### Public methods
+
+| Method | Description |
+|--------|-------------|
+| `mount(el)` | Mount into a DOM host |
+| `load(source)` | Load and analyze audio |
+| `destroy()` | Dispose DOM, transport, and `AudioContext` |
+| `play` / `pause` / `stop` / `togglePlay` | Transport |
+| `skipForward` / `skipBackward` | Jump by `skipSeconds` |
+| `fit()` | Fit viewport to full length |
+| `setViewMode(mode)` | `"waveform"` \| `"spectrogram"` |
+| `setPlayChannelMode(mode)` | original / mono / solo |
+| `copySelection` / `cutSelection` / `pasteClipboard` / `deleteSelection` | Edit |
+| `undo` / `redo` | Undo / redo |
+| `exportSelection` / `exportAll` | Export 16-bit WAV |
+| `setRecordDurationSec(sec)` | Fixed recording duration |
+| `startRecording(sec?)` / `stopRecording()` | Microphone recording |
+
+### Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play / pause |
+| ← / → | Nudge playhead |
+| Shift+← / → | Skip back / forward |
+| Home / End | Start / end |
+| W / S | Waveform / spectrogram |
 | O / M | Original / Mono |
 | 1 / 2 | Solo Ch1 / Ch2 |
-| Shift+拖拽 | 选区 |
-| 空格+拖拽 / Alt+拖拽 | 平移 |
-| 滚轮 | 缩放 |
-| Ctrl/⌘+X | 剪切选区 |
-| Ctrl/⌘+C | 复制选区 |
-| Ctrl/⌘+V | 粘贴（有选区则替换，否则在游标插入） |
-| Delete / Backspace | 删除选区 |
-| Ctrl/⌘+Z | 撤销 |
-| Ctrl/⌘+Shift+Z 或 Ctrl/⌘+Y | 重做 |
+| Shift+drag | Selection |
+| Space+drag / Alt+drag | Pan |
+| Wheel | Zoom |
+| Ctrl/⌘+X | Cut selection |
+| Ctrl/⌘+C | Copy selection |
+| Ctrl/⌘+V | Paste (replace selection, or insert at playhead) |
+| Delete / Backspace | Delete selection |
+| Ctrl/⌘+Z | Undo |
+| Ctrl/⌘+Shift+Z or Ctrl/⌘+Y | Redo |
 
-### 录音
+### Recording
 
-工具栏选择「录音时长」（1 / 5 / 10 / 30 分钟），点「录音」授权麦克风后开始：
+Pick a duration in the toolbar (1 / 5 / 10 / 30 minutes), then click **Record** and allow the mic:
 
-- 时间轴长度 = 所选固定时长，**始终一屏显示全长**
-- 波形从左向右生长，游标跟随已录位置
-- 录满自动结束，或点「停录」提前结束（裁切到实际长度）
-- 结束后自动分析，可播放 / 编辑 / 导出
+- Timeline length = chosen fixed duration, **always shown full-width on one screen**
+- Waveform grows left→right; playhead follows the write head
+- Stops automatically when full, or click **Stop Rec** early (trimmed to actual length)
+- After stop, analysis runs; then you can play / edit / export
 
-### 编辑说明
+### Editing notes
 
-- 剪贴板为控件内部缓存（不写入系统剪贴板）；重新 `load` 会清空撤销历史。
-- 编辑后会重新跑 worker 分析与语谱烘焙（后台进行）；若编辑前正在播放，会保持播放并续播。
-- 导出为 16-bit PCM WAV，浏览器触发下载。
+- Clipboard is internal to the control (not the system clipboard); calling `load` again clears undo history.
+- After an edit, worker analysis and spectrogram bake run in the background; if playback was active, it tries to keep playing.
+- Export is 16-bit PCM WAV and triggers a browser download.
 
-### 语谱 dB
+### Spectrogram dB
 
-工具栏「dB 最小 / dB 最大」控制动态范围映射：  
-默认约 `-100` ~ `-5`。拉高最大值会减少“过热”的红白区域。
+Toolbar **dB min / dB max** map the color dynamic range (defaults about `-100` ~ `-5`). Raising the max reduces “overheated” red/white regions.
 
-## 架构摘要
+## Architecture
 
 ```
-UI / 交互 / Canvas 渲染  ← TypeScript（主线程；语谱为 ImageBitmap blit）
+UI / interaction / Canvas render  ← TypeScript (main thread; spectrogram = ImageBitmap blit)
         ↓
- analysis.worker.ts     ← WebWorker
+ analysis.worker.ts               ← WebWorker
         ↓
- Rust WASM              ← peaks 金字塔、STFT、WSOLA
+ Rust WASM                        ← peaks pyramid, STFT, WSOLA
 ```
 
-长音频会自动加大 hop、降低 `maxFrames`，缩短分析时间。
+Longer audio automatically increases hop and lowers `maxFrames` to keep analysis time reasonable.

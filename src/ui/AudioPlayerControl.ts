@@ -3,6 +3,7 @@ import type {
   AudioPlayerControlOptions,
   LoadProgress,
   PlayChannelMode,
+  ToolbarGroup,
   ViewMode,
 } from "../types.js";
 import { PlayerStateStore } from "../core/PlayerStateStore.js";
@@ -118,6 +119,10 @@ export class AudioPlayerControl {
     this.recorder = new LiveRecorder(this.audioContext);
   }
 
+  /**
+   * 挂载到 DOM。会清空 el 并写入工具栏/画布。
+   * @param el 宿主元素
+   */
   mount(el: HTMLElement): void {
     this.destroyDom();
     this.root = el;
@@ -224,6 +229,10 @@ export class AudioPlayerControl {
     this.updateChrome();
   }
 
+  /**
+   * 加载音频并分析。
+   * @param source File / Blob / URL 字符串 / ArrayBuffer / AudioBuffer
+   */
   async load(source: File | Blob | string | ArrayBuffer | AudioBuffer): Promise<void> {
     if (this.recording) {
       await this.recorder.stop({ finalize: false });
@@ -270,6 +279,7 @@ export class AudioPlayerControl {
     }
   }
 
+  /** 销毁 DOM、运输与 AudioContext。 */
   destroy(): void {
     this.destroyDom();
     this.transport.dispose();
@@ -300,9 +310,17 @@ export class AudioPlayerControl {
   skipBackward(): void {
     this.transport.skipBackward();
   }
+  /**
+   * 切换主视图。
+   * @param mode `"waveform"` | `"spectrogram"`
+   */
   setViewMode(mode: ViewMode): void {
     this.store.patch({ viewMode: mode });
   }
+  /**
+   * 设置通道路由。
+   * @param mode `{ kind:"original" }` | `{ kind:"mono" }` | `{ kind:"solo", channel:number }`
+   */
   setPlayChannelMode(mode: PlayChannelMode): void {
     this.transport.setChannelMode(mode);
   }
@@ -314,6 +332,10 @@ export class AudioPlayerControl {
     return this.recording;
   }
 
+  /**
+   * 设置固定录音时长（秒），并同步工具栏下拉。
+   * @param sec 如 60 / 300 / 600 / 1800
+   */
   setRecordDurationSec(sec: number): void {
     if (!(sec > 0)) return;
     this.recordDurationSec = sec;
@@ -324,6 +346,10 @@ export class AudioPlayerControl {
     this.updateChrome();
   }
 
+  /**
+   * 开始麦克风录音（需用户手势 + HTTPS/localhost）。
+   * @param durationSec 可选；默认用 setRecordDurationSec 的值
+   */
   async startRecording(durationSec?: number): Promise<void> {
     if (this.recording || this.editBusy) return;
     const dur = Math.max(1, durationSec ?? this.recordDurationSec);
@@ -777,17 +803,29 @@ export class AudioPlayerControl {
     }
   }
 
+  private applyToolbarVisibility(toolbar: HTMLElement): void {
+    const cfg = this.options.toolbar ?? "all";
+    if (cfg === "all") return;
+    const allowed = new Set(cfg);
+    for (const el of toolbar.querySelectorAll<HTMLElement>("[data-group]")) {
+      const group = el.dataset.group;
+      if (!group || !allowed.has(group as ToolbarGroup)) {
+        el.hidden = true;
+      }
+    }
+  }
+
   private buildDom(): DocumentFragment {
     const frag = document.createDocumentFragment();
     const toolbar = document.createElement("div");
     toolbar.className = "apc-toolbar";
     toolbar.innerHTML = `
-      <button type="button" data-act="play" title="播放/暂停（空格）">播放</button>
-      <button type="button" data-act="stop" title="停止（回到 0）">停止</button>
-      <button type="button" data-act="back" title="快退（Shift+←）">快退</button>
-      <button type="button" data-act="fwd" title="快进（Shift+→）">快进</button>
-      <button type="button" data-act="fit" title="适配全长">适配</button>
-      <label>录音时长
+      <button type="button" data-group="transport" data-act="play" title="播放/暂停（空格）">播放</button>
+      <button type="button" data-group="transport" data-act="stop" title="停止（回到 0）">停止</button>
+      <button type="button" data-group="transport" data-act="back" title="快退（Shift+←）">快退</button>
+      <button type="button" data-group="transport" data-act="fwd" title="快进（Shift+→）">快进</button>
+      <button type="button" data-group="transport" data-act="fit" title="适配全长">适配</button>
+      <label data-group="record">录音时长
         <select data-act="rec-dur" title="固定时长：整段一屏显示，波形从左生长">
           <option value="60">1 分钟</option>
           <option value="300" selected>5 分钟</option>
@@ -795,11 +833,11 @@ export class AudioPlayerControl {
           <option value="1800">30 分钟</option>
         </select>
       </label>
-      <button type="button" data-act="rec-start" title="开始麦克风录音">录音</button>
-      <button type="button" data-act="rec-stop" title="停止录音" disabled>停录</button>
-      <button type="button" data-act="wave" data-view="waveform" class="active">波形</button>
-      <button type="button" data-act="spec" data-view="spectrogram">语谱</button>
-      <label>通道
+      <button type="button" data-group="record" data-act="rec-start" title="开始麦克风录音">录音</button>
+      <button type="button" data-group="record" data-act="rec-stop" title="停止录音" disabled>停录</button>
+      <button type="button" data-group="view" data-act="wave" data-view="waveform" class="active" title="切换到波形视图（W）">波形</button>
+      <button type="button" data-group="view" data-act="spec" data-view="spectrogram" title="切换到语谱视图（S）">语谱</button>
+      <label data-group="channel" title="监听模式：原声立体声 / 单声道混音 / 独奏某一轨（非独奏轨会变暗）">通道
         <select data-act="channel">
           <option value="original">原声</option>
           <option value="mono">单声道</option>
@@ -807,7 +845,7 @@ export class AudioPlayerControl {
           <option value="solo-1">独奏 右（Ch2）</option>
         </select>
       </label>
-      <label>倍速
+      <label data-group="rate" title="WSOLA 变速：改变速度，尽量保持音高">倍速
         <select data-act="rate">
           <option value="0.5">0.5×</option>
           <option value="0.75">0.75×</option>
@@ -817,27 +855,46 @@ export class AudioPlayerControl {
           <option value="2">2×</option>
         </select>
       </label>
-      <label>音量 <input data-act="volume" type="range" min="0" max="1" step="0.01" value="1" /></label>
-      <label><input data-act="mute" type="checkbox" /> 静音</label>
-      <label><input data-act="follow" type="checkbox" checked /> 跟随</label>
-      <label><input data-act="snap" type="checkbox" checked /> 吸附到过零点</label>
-      <label><input data-act="selonly" type="checkbox" /> 仅播放选区</label>
-      <label><input data-act="loop" type="checkbox" /> 选区循环</label>
-      <label><input data-act="gainlink" type="checkbox" checked /> 联动增益</label>
-      <label>增益 <input data-act="gain" type="range" min="0.2" max="4" step="0.05" value="1" /></label>
-      <label>dB 最小 <input data-act="mindb" type="number" value="-100" style="width:56px" /></label>
-      <label>dB 最大 <input data-act="maxdb" type="number" value="-5" style="width:56px" /></label>
-      <button type="button" data-act="cut" title="剪切选区（Ctrl/⌘+X）">剪切</button>
-      <button type="button" data-act="copy" title="复制选区（Ctrl/⌘+C）">复制</button>
-      <button type="button" data-act="paste" title="粘贴（Ctrl/⌘+V）">粘贴</button>
-      <button type="button" data-act="delete-sel" title="删除选区（Delete）">删除</button>
-      <button type="button" data-act="undo" title="撤销（Ctrl/⌘+Z）">撤销</button>
-      <button type="button" data-act="redo" title="重做（Ctrl/⌘+Shift+Z）">重做</button>
-      <button type="button" data-act="export-sel" title="导出选区 WAV">导出选区</button>
-      <button type="button" data-act="export-all" title="导出整段 WAV">导出整段</button>
-      <button type="button" data-act="clear-sel">清除选区</button>
+      <label data-group="volume" title="输出音量（不影响波形数据本身）">音量 <input data-act="volume" type="range" min="0" max="1" step="0.01" value="1" /></label>
+      <label data-group="volume" title="静音：听不到声音，播放进度照常">
+        <input data-act="mute" type="checkbox" /> 静音
+      </label>
+      <label data-group="follow" title="播放时视口是否跟随游标：开=画面跟着滚，关=画面固定">
+        <input data-act="follow" type="checkbox" checked /> 跟随
+      </label>
+      <label data-group="snap" title="选区/点击是否吸附过零点：开=剪切更干净，关=自由像素选">
+        <input data-act="snap" type="checkbox" checked /> 吸附到过零点
+      </label>
+      <label data-group="selectionPlay" title="开启后只播放选区范围内的音频">
+        <input data-act="selonly" type="checkbox" /> 仅播放选区
+      </label>
+      <label data-group="selectionPlay" title="选区播完是否从头循环（常与「仅播放选区」联用）">
+        <input data-act="loop" type="checkbox" /> 选区循环
+      </label>
+      <label data-group="gain" title="各声道波形增益是否共用同一数值">
+        <input data-act="gainlink" type="checkbox" checked /> 联动增益
+      </label>
+      <label data-group="gain" title="波形垂直放大，便于看小信号">
+        增益 <input data-act="gain" type="range" min="0.2" max="4" step="0.05" value="1" />
+      </label>
+      <label data-group="spectrogram" title="语谱颜色映射下限（dB）：抬高可压掉弱噪声">
+        dB 最小 <input data-act="mindb" type="number" value="-100" style="width:56px" />
+      </label>
+      <label data-group="spectrogram" title="语谱颜色映射上限（dB）：降低会让强能量更快顶满色阶">
+        dB 最大 <input data-act="maxdb" type="number" value="-5" style="width:56px" />
+      </label>
+      <button type="button" data-group="edit" data-act="cut" title="剪切选区（Ctrl/⌘+X）">剪切</button>
+      <button type="button" data-group="edit" data-act="copy" title="复制选区（Ctrl/⌘+C）">复制</button>
+      <button type="button" data-group="edit" data-act="paste" title="粘贴（Ctrl/⌘+V）">粘贴</button>
+      <button type="button" data-group="edit" data-act="delete-sel" title="删除选区（Delete）">删除</button>
+      <button type="button" data-group="edit" data-act="undo" title="撤销（Ctrl/⌘+Z）">撤销</button>
+      <button type="button" data-group="edit" data-act="redo" title="重做（Ctrl/⌘+Shift+Z）">重做</button>
+      <button type="button" data-group="export" data-act="export-sel" title="导出选区 WAV">导出选区</button>
+      <button type="button" data-group="export" data-act="export-all" title="导出整段 WAV">导出整段</button>
+      <button type="button" data-group="selection" data-act="clear-sel">清除选区</button>
       <span class="apc-clock">00:00.000</span>
     `;
+    this.applyToolbarVisibility(toolbar);
     const status = document.createElement("div");
     status.className = "apc-status";
     status.textContent = "Load an audio file to begin";
@@ -1136,6 +1193,37 @@ export class AudioPlayerControl {
     const specBtn = this.root?.querySelector('[data-act="spec"]');
     waveBtn?.classList.toggle("active", state.viewMode === "waveform");
     specBtn?.classList.toggle("active", state.viewMode === "spectrogram");
+
+    const syncCheck = (
+      act: string,
+      on: boolean,
+    ) => {
+      const el = this.root?.querySelector(`[data-act="${act}"]`) as HTMLInputElement | null;
+      if (el && el.checked !== on) el.checked = on;
+    };
+    syncCheck("mute", state.muted);
+    syncCheck("follow", state.followPlayhead);
+    syncCheck("snap", state.snapToZeroCrossing);
+    syncCheck("selonly", state.playSelectionOnly);
+    syncCheck("loop", state.loopSelection);
+    syncCheck("gainlink", state.waveformGainLinked);
+
+    const rateSel = this.root?.querySelector('[data-act="rate"]') as HTMLSelectElement | null;
+    if (rateSel) {
+      const rateStr = String(state.playbackRate);
+      if ([...rateSel.options].some((o) => o.value === rateStr) && rateSel.value !== rateStr) {
+        rateSel.value = rateStr;
+      }
+    }
+
+    const minDb = this.root?.querySelector('[data-act="mindb"]') as HTMLInputElement | null;
+    const maxDb = this.root?.querySelector('[data-act="maxdb"]') as HTMLInputElement | null;
+    if (minDb && minDb.value !== String(state.spectrogramMinDb)) {
+      minDb.value = String(state.spectrogramMinDb);
+    }
+    if (maxDb && maxDb.value !== String(state.spectrogramMaxDb)) {
+      maxDb.value = String(state.spectrogramMaxDb);
+    }
 
     const select = this.root?.querySelector('[data-act="channel"]') as HTMLSelectElement | null;
     if (select && state.channelCount > 0) {
