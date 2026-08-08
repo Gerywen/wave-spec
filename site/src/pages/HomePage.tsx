@@ -35,7 +35,7 @@ export function HomePage() {
 
       <figure className="home-preview">
         <img
-          src="/overview-preview.jpg"
+          src={`${import.meta.env.BASE_URL}overview-preview.jpg`}
           alt={t(ui.homePreviewAlt)}
           width={1200}
           height={560}
