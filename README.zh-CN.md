@@ -32,6 +32,14 @@ npm run dev
 npm run site:dev
 ```
 
+### 在线演示（GitHub Pages）
+
+在仓库 Settings → Pages → Source 选择 **GitHub Actions** 后，站点地址为：
+
+**https://gerywen.github.io/wave-spec/**
+
+推送到 `main` 会触发 `.github/workflows/deploy-pages.yml` 自动构建发布。
+
 ### React 示例站（`site/`）
 
 类似 Wavesurfer Examples：左侧导航 + 右侧示例；首页概览 + 各功能独立路由。  

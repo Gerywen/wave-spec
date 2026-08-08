@@ -21,6 +21,7 @@
     "site:dev": "vite --config site/vite.config.ts",
     "site:build": "vite build --config site/vite.config.ts",
     "site:preview": "vite preview --config site/vite.config.ts",
+    "site:build:pages": "SITE_BASE=/wave-spec/ vite build --config site/vite.config.ts && cp dist-site/index.html dist-site/404.html",
     "build": "tsc --noEmit && vite build",
     "build:lib": "tsc --noEmit && vite build --config vite.lib.config.ts",
     "preview": "vite preview"

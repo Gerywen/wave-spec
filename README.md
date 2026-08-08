@@ -32,6 +32,14 @@ npm run dev
 npm run site:dev
 ```
 
+### Live demo (GitHub Pages)
+
+After Pages is enabled (Settings → Pages → Source: **GitHub Actions**), the site is published at:
+
+**https://gerywen.github.io/wave-spec/**
+
+Pushing to `main` runs `.github/workflows/deploy-pages.yml` and updates the site automatically.
+
 ### React examples site (`site/`)
 
 Similar to Wavesurfer Examples: left nav + right demo; overview home + per-feature routes.  
