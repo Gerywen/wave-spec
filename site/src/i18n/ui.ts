@@ -7,7 +7,7 @@ export const ui = {
   apiNavTag: L("API", "API"),
   apiNavTitle: L("参数与方法", "API Reference"),
   examples: L("示例", "Examples"),
-  viewRepo: L("查看仓库 ↗", "Repository ↗"),
+  viewRepo: L("在 GitHub 查看", "View on GitHub"),
   langZh: L("中文", "中文"),
   langEn: L("EN", "EN"),
   langSwitchAria: L("切换语言", "Switch language"),

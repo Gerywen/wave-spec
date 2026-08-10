@@ -200,11 +200,18 @@ kbd {
 }
 
 .sidebar-repo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   margin-top: 14px;
   padding: 10px;
   border-top: 1px solid var(--line);
   color: var(--accent);
   font-size: 0.88rem;
+}
+
+.sidebar-repo-icon {
+  flex-shrink: 0;
 }
 
 .content {

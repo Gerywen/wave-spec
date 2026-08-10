@@ -143,7 +143,7 @@ await player.load(file); // File / URL / AudioBuffer</code></pre>
       <strong>playback-controls</strong>
       <p>多分轨波形 / 语谱音频播放控件 · MIT</p>
     </div>
-    <a href="https://gitee.com/lantuyuntuo/playback-controls" target="_blank" rel="noreferrer">
+    <a href="https://github.com/Gerywen/wave-spec" target="_blank" rel="noreferrer">
       查看仓库
     </a>
   </footer>

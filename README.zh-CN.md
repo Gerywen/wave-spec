@@ -4,7 +4,7 @@
 
 多分轨波形 / 语谱音频播放控件（TypeScript 库 + Vite Demo + Rust/WASM 分析）。
 
-仓库：https://gitee.com/lantuyuntuo/playback-controls
+仓库：https://github.com/Gerywen/wave-spec
 
 ## 功能
 

@@ -4,7 +4,7 @@ English | [简体中文](./README.zh-CN.md)
 
 Multi-lane waveform / spectrogram audio player control (TypeScript library + Vite demos + Rust/WASM analysis).
 
-Repository: https://gitee.com/lantuyuntuo/playback-controls
+Repository: https://github.com/Gerywen/wave-spec
 
 ## Features
 
